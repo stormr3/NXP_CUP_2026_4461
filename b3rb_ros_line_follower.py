@@ -37,18 +37,68 @@ TURN_MAX = 1.0
 # - turn: positive for left steer, negative for right steer. Range: [-1.0, 1.0]
 # msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1] (Keep buttons set to this pattern for manual override mode)
 
+# NOTE on vector_1 / vector_2: each is geometry_msgs/Point[2] - a FIXED-size
+# array of 2 points, always present regardless of vector_count. There's no
+# documented near/far ordering for the two points, so every calculation below
+# uses the AVERAGE of both points' x as "where this line sits horizontally" -
+# this is exactly what your original working code did, and it doesn't depend
+# on any assumption about point ordering.
+
+# ------------------ TUNABLE PARAMETERS ------------------
+# These don't touch the control bounds above - they're gains/speeds/thresholds
+# for the two driving modes below.
+
+# Which mode runs on boot: "LANE_FOLLOW" (double solid lines) or
+# "LINE_FOLLOW" (single committed line, for intersections). Change this
+# constant and restart the node to switch which one you're testing.
+DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
+
+# Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
+DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
+
+# Same Kp and offset ratio as your original working lane follower - unchanged.
+STEER_KP = 0.004
+LANE_GAP_OFFSET_RATIO = 0.4
+
+# If the two detected boundaries' midpoints are farther apart than this
+# fraction of image width, they're too far apart to be a real parallel lane
+# pair - almost certainly one of them is a foreign edge (e.g. the near curb
+# of a cross-street revealed mid-turn), not your actual right/left boundary.
+# Heuristic starting point, not measured against your sim - log the real
+# track_width value during a tight-turn run and adjust if this fires too
+# early/late.
+TRACK_WIDTH_DIVERGENCE_RATIO = 1
+
+# LANE_FOLLOW speeds
+LANE_SPEED_TWO_LINES = 0.70    # confident: both boundaries agree on a normal-width track
+LANE_SPEED_ONE_LINE = 0.35     # only one boundary in play (either genuinely one visible, or divergence fallback)
+LANE_SPEED_LOST_SHORT = 0.30   # briefly no boundary at all: hold last turn, ease off speed
+LANE_SPEED_LOST_LONG = 0.15    # lost for a while: crawl instead of driving blind at speed
+LANE_LOST_GRACE_FRAMES = 5     # frames before dropping from LOST_SHORT to LOST_LONG speed
+
+# LINE_FOLLOW speeds/behavior (single committed line, e.g. through an intersection)
+LINE_GAP_PX = 40.0             # if committed line's midpoint crosses within this many px of center, we're driving over it
+LINE_TURN_HOLD = 0.45          # steer magnitude to hold a turn arc toward the committed line
+LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on top of the line
+LINE_SPEED_TRACK = 0.35        # speed while the committed line is visible and tracked
+LINE_SPEED_BLIND = 0.28        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
+
+
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
-    By default, it publishes a safe drive-straight command on a timer loop.
-    Implement logic inside the callbacks to steer, dodge obstacles, detect destinations,
-    communicate with the server, and park.
+    Two selectable driving modes (see drive_mode / follow_side):
+      - LANE_FOLLOW: your original centering/single-line logic, extended with
+        a fallback for when the two detected boundaries diverge too far to be
+        a real lane pair (tight-turn cross-edge case).
+      - LINE_FOLLOW: commits to ONE line and holds a gap to it; if it vanishes
+        (turn apex), holds a turn arc toward it until reacquired.
     """
     def __init__(self):
         super().__init__('line_follower')
 
         # ------------------ Subscriptions ------------------
-        
+
         # 1. Lane Edge Vectors (from edge_vectors_publisher)
         self.subscription_vectors = self.create_subscription(
             EdgeVectors,
@@ -85,7 +135,7 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT)
 
         # ------------------ Publishers ------------------
-        
+
         # Publisher to drive/steer the buggy
         self.publisher_joy = self.create_publisher(
             Joy,
@@ -99,10 +149,10 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT)
 
         # ------------------ State Variables & Timer ------------------
-        
+
         # Default controls: drive straight slowly
         self.target_speed = 0.15
-        self.target_turn = 0.1
+        self.target_turn = 0.0
 
         # State variables (You can add your own state flags / state machines here)
         self.obstacle_in_front = False
@@ -110,11 +160,34 @@ class LineFollower(Node):
         self.hospital_id = None
         self.current_destination = None
         self.mission_completed = False
+        # Racing line / late apex entry tracking
+        self.horizontal_line_frames = 0
+
+        # ---- Driving mode ----
+        # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
+        # DEFAULT_FOLLOW_SIDE if testing LINE_FOLLOW) at the top of this file
+        # and restart the node. Later, sign_board_callback can set
+        # self.drive_mode / self.follow_side directly instead.
+        self.drive_mode = DEFAULT_DRIVE_MODE      # "LANE_FOLLOW" or "LINE_FOLLOW"
+        self.follow_side = DEFAULT_FOLLOW_SIDE    # "LEFT" or "RIGHT" (LINE_FOLLOW only)
+
+        # LANE_FOLLOW bookkeeping
+        self.lane_lost_frame_count = 0
+        self.last_target_x = None  # last commanded target_x, used to keep the
+                                    # divergence fallback picking the SAME
+                                    # boundary frame-to-frame instead of
+                                    # potentially flip-flopping between the two
+
+        # LINE_FOLLOW bookkeeping
+        self.line_blind_frame_count = 0
 
         # Timer to publish drive commands at 10Hz
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
-        self.get_logger().info("Line Follower controller initialized. Safe Drive-Straight Mode active.")
+        self.get_logger().info(
+            f"Line Follower controller initialized. drive_mode={self.drive_mode}"
+            + (f" follow_side={self.follow_side}" if self.drive_mode == "LINE_FOLLOW" else "")
+        )
 
     def publish_drive_commands(self):
         """Timer callback that periodically publishes the current speed and steer command."""
@@ -128,29 +201,159 @@ class LineFollower(Node):
         self.target_speed = float(max(min(speed, SPEED_MAX), -SPEED_MAX))
         self.target_turn = float(max(min(turn, TURN_MAX), -TURN_MAX))
 
+    # ------------------ Mode: LANE_FOLLOW ------------------
+
+    def _handle_lane_follow(self, message, width, half_width):
+        count = message.vector_count
+
+        if count == 2:
+            # Same midpoint math as your original working code.
+            v1_mid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+            v2_mid_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+            track_width = abs(v1_mid_x - v2_mid_x)
+
+            if track_width <= (width * TRACK_WIDTH_DIVERGENCE_RATIO):
+                # Normal case: genuine parallel lane pair -> center between them.
+                target_x = (v1_mid_x + v2_mid_x) / 2.0
+                self.target_speed = LANE_SPEED_TWO_LINES
+            else:
+                # Divergence too large to be a real lane pair. Treat this as a
+                # single-line situation: pick whichever of the two midpoints
+                # is closer to where we were just tracking (so we don't
+                # suddenly jump to whichever one happens to be first), and
+                # ignore the other one entirely.
+                if self.last_target_x is None:
+                    chosen_mid_x = min(v1_mid_x, v2_mid_x, key=lambda x: abs(x - half_width))
+                else:
+                    chosen_mid_x = min(v1_mid_x, v2_mid_x, key=lambda x: abs(x - self.last_target_x))
+
+                offset = width * LANE_GAP_OFFSET_RATIO
+                if chosen_mid_x < half_width:
+                    target_x = chosen_mid_x + offset
+                else:
+                    target_x = chosen_mid_x - offset
+                speed = LANE_SPEED_ONE_LINE
+
+            error = half_width - target_x
+            self.target_turn = max(-1.0, min(1.0, STEER_KP * error))
+            self.last_target_x = target_x
+            self.lane_lost_frame_count = 0
+
+        elif count == 1:
+            p0 = message.vector_1[0]
+            p1 = message.vector_1[1]
+
+            dx = abs(p0.x - p1.x)
+            dy = abs(p0.y - p1.y)
+
+            # Detect horizontal/perpendicular line across camera view
+            if dx > (dy * 3):
+                self.horizontal_line_frames += 1
+                line_center_x = (p0.x + p1.x) / 2.0
+
+                if line_center_x >= half_width:
+                    # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
+                    self.target_turn = (0.0+dx/dy*0.1) 
+                    self.target_speed = 0.35
+                else:
+                    # PHASE 2: Hit the Apex! (Hard Right Turn)
+                    self.target_turn = -(0.0+dx/dy*0.1) 
+                    self.target_speed = 0.35
+            else:
+                # Reset counter when line is back to normal vertical orientation
+                self.horizontal_line_frames = 0
+
+                # Normal single vertical line tracking
+                v1_mid_x = (p0.x + p1.x) / 2.0
+                offset = width * LANE_GAP_OFFSET_RATIO
+
+                if v1_mid_x < half_width:
+                    target_x = v1_mid_x + offset
+                else:
+                    target_x = v1_mid_x - offset
+
+                error = half_width - target_x
+                self.target_turn = max(-1.0, min(1.0, (STEER_KP) * error))
+                self.target_speed = LANE_SPEED_ONE_LINE
+
+            self.last_target_x = (p0.x + p1.x) / 2.0
+            self.lane_lost_frame_count = 0
+
+        else:
+            # No boundary visible at all. Hold the last steering command
+            # rather than snapping to straight/center - if we were mid-turn
+            # when we lost both lines, straight is the wrong guess. Ease off
+            # speed the longer this persists.
+            self.lane_lost_frame_count += 1
+            self.target_speed = (LANE_SPEED_LOST_SHORT
+                     if self.lane_lost_frame_count <= LANE_LOST_GRACE_FRAMES
+                     else LANE_SPEED_LOST_LONG)
+            # last_target_x intentionally left unchanged - preserves
+            # continuity for when a boundary reappears.
+
+    # ------------------ Mode: LINE_FOLLOW ------------------
+
+    def _handle_line_follow(self, message, width, half_width):
+        count = message.vector_count
+        sign = 1.0 if self.follow_side == "LEFT" else -1.0
+
+        candidates = []
+        if count >= 1:
+            candidates.append((message.vector_1[0].x + message.vector_1[1].x) / 2.0)
+        if count >= 2:
+            candidates.append((message.vector_2[0].x + message.vector_2[1].x) / 2.0)
+
+        # Among detected boundaries, find the one on the side we've committed
+        # to. Deliberately NOT "whichever is closer" - once committed at a
+        # split, stick to that side even if the other briefly appears too, so
+        # we don't flip-flop mid-intersection.
+        target_mid_x = None
+        for mid_x in candidates:
+            if self.follow_side == "LEFT" and mid_x < half_width:
+                target_mid_x = mid_x
+                break
+            if self.follow_side == "RIGHT" and mid_x >= half_width:
+                target_mid_x = mid_x
+                break
+
+        if target_mid_x is not None:
+            if self.follow_side == "LEFT":
+                too_close = target_mid_x > (half_width - LINE_GAP_PX)
+            else:
+                too_close = target_mid_x < (half_width + LINE_GAP_PX)
+
+            self.target_turn = -1 * sign * (LINE_TURN_EASE if too_close else LINE_TURN_HOLD)
+            self.target_speed = LINE_SPEED_TRACK
+            self.line_blind_frame_count = 0
+        else:
+            # Committed line isn't visible this frame (e.g. turn apex). Keep
+            # sweeping in the committed direction at reduced speed until it
+            # reappears, rather than going straight/blind.
+            self.line_blind_frame_count += 1
+            self.target_turn = -1 * sign * LINE_TURN_HOLD
+            self.target_speed = LINE_SPEED_BLIND
+
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
         """
-        Receives lane boundaries from the camera vector extractor.
-        
-        GUIDELINE (Lane Following):
-        - `message.vector_count` contains the number of active bounds seen (0, 1, or 2).
-        - `message.vector_1` and `message.vector_2` contain the points defining the bounds.
-        - You need to write logic to compute the centerline deviation and adjust `self.target_turn`.
-        - E.g., if only one line is seen, steer away from it to keep distance; if two lines are seen,
-          calculate the midpoint relative to the image width and steer to center the buggy.
+        Receives lane boundaries from the camera vector extractor and
+        dispatches to whichever mode is active (see drive_mode / follow_side).
         """
-        # HINTS:
-        # width = message.image_width
-        # half_width = width / 2.0
-        # For now, we do not modify self.target_turn so the buggy continues straight.
-        pass
+        width = float(message.image_width)
+        if width <= 0:
+            return  # guard against a boot/glitch frame with no valid image_width
+        half_width = width / 2.0
+
+        if self.drive_mode == "LANE_FOLLOW":
+            self._handle_lane_follow(message, width, half_width)
+        elif self.drive_mode == "LINE_FOLLOW":
+            self._handle_line_follow(message, width, half_width)
 
     def lidar_callback(self, message):
         """
         Receives LIDAR range measurements.
-        
+
         GUIDELINE (Obstacle Avoidance & Building Range):
         - `message.ranges` is an array of distances in meters around the buggy.
         - The laser scans cover 360 degrees. Find which indices correspond to the front of the buggy.
@@ -167,7 +370,7 @@ class LineFollower(Node):
     def server_communication_callback(self, message):
         """
         Receives coordination commands from the server.
-        
+
         GUIDELINE (Server Communication):
         - Check if the message is destined for the Buggy (`message.dest == 1`).
 		- Do not forget to check for ACK messages from server
@@ -193,7 +396,7 @@ class LineFollower(Node):
     def qr_detection_callback(self, message):
         """
         Receives QR codes scanned from the buildings.
-        
+
         GUIDELINE (Patient/Hospital Identification):
         - Parse the decoded string payload in `message.data` (e.g. "PATIENT_A", "HOSPITAL_B").
         - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
@@ -205,12 +408,16 @@ class LineFollower(Node):
     def sign_board_callback(self, message):
         """
         Receives traffic sign boards.
-        
+
         GUIDELINE (Sign Board Routing):
         - Use the detected signs to choose the quickest route at intersections.
+        - Not wired up yet - once this parses real signs, it can set
+          self.drive_mode = "LINE_FOLLOW" and self.follow_side = "LEFT"/"RIGHT"
+          directly instead of the DEFAULT_* constants at the top of the file.
         """
         self.get_logger().info(f"Heard Sign Board: {message.data}")
         pass
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -222,6 +429,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
