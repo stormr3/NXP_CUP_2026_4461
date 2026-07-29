@@ -51,7 +51,7 @@ TURN_MAX = 1.0
 # Which mode runs on boot: "LANE_FOLLOW" (double solid lines) or
 # "LINE_FOLLOW" (single committed line, for intersections). Change this
 # constant and restart the node to switch which one you're testing.
-DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
+DEFAULT_DRIVE_MODE = "LINE_FOLLOW"
 
 # Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
 DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
@@ -75,6 +75,7 @@ LANE_SPEED_ONE_LINE = 0.35     # only one boundary in play (either genuinely one
 LANE_SPEED_LOST_SHORT = 0.30   # briefly no boundary at all: hold last turn, ease off speed
 LANE_SPEED_LOST_LONG = 0.15    # lost for a while: crawl instead of driving blind at speed
 LANE_LOST_GRACE_FRAMES = 5     # frames before dropping from LOST_SHORT to LOST_LONG speed
+LANE_APEX_BLIND_GRACE_FRAMES = 10  # frames to keep sustaining the apex turn after the line vanishes mid-apex, before giving up and falling back to generic lost-line handling
 
 # LINE_FOLLOW speeds/behavior (single committed line, e.g. through an intersection)
 LINE_GAP_PX = 40.0             # if committed line's midpoint crosses within this many px of center, we're driving over it
@@ -162,6 +163,9 @@ class LineFollower(Node):
         self.mission_completed = False
         # Racing line / late apex entry tracking
         self.horizontal_line_frames = 0
+        self.apex_active = False   # True if the line vanished WHILE it was in apex/horizontal orientation
+        self.apex_turn = 0.0       # the turn command to sustain while apex_active
+        self.apex_blind_frames = 0
 
         # ---- Driving mode ----
         # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
@@ -232,7 +236,7 @@ class LineFollower(Node):
                     target_x = chosen_mid_x + offset
                 else:
                     target_x = chosen_mid_x - offset
-                speed = LANE_SPEED_ONE_LINE
+                self.target_speed = LANE_SPEED_ONE_LINE
 
             error = half_width - target_x
             self.target_turn = max(-1.0, min(1.0, STEER_KP * error))
@@ -259,9 +263,19 @@ class LineFollower(Node):
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
                     self.target_turn = -(0.0+dx/dy*0.1) 
                     self.target_speed = 0.35
+
+                # Remember this as the committed apex turn - if the line
+                # vanishes entirely on the very next frame (very common right
+                # at the apex), we want to keep applying THIS turn rather
+                # than falling into the generic "no idea, hold whatever was
+                # last set and slow down" fallback below.
+                self.apex_active = True
+                self.apex_turn = self.target_turn
+                self.apex_blind_frames = 0
             else:
                 # Reset counter when line is back to normal vertical orientation
                 self.horizontal_line_frames = 0
+                self.apex_active = False  # back to normal tracking, not mid-apex anymore
 
                 # Normal single vertical line tracking
                 v1_mid_x = (p0.x + p1.x) / 2.0
@@ -280,14 +294,28 @@ class LineFollower(Node):
             self.lane_lost_frame_count = 0
 
         else:
-            # No boundary visible at all. Hold the last steering command
-            # rather than snapping to straight/center - if we were mid-turn
-            # when we lost both lines, straight is the wrong guess. Ease off
-            # speed the longer this persists.
-            self.lane_lost_frame_count += 1
-            self.target_speed = (LANE_SPEED_LOST_SHORT
-                     if self.lane_lost_frame_count <= LANE_LOST_GRACE_FRAMES
-                     else LANE_SPEED_LOST_LONG)
+            # No boundary visible at all.
+            if self.apex_active and self.apex_blind_frames < LANE_APEX_BLIND_GRACE_FRAMES:
+                # We were mid-apex (line horizontal) and it just vanished -
+                # this is the exact case you asked about. Keep sustaining
+                # THAT turn at a real driving speed (not a crawl) for a
+                # short grace period, since we expect to sweep back onto the
+                # line shortly, rather than treating this as a generic
+                # "totally lost" event.
+                self.apex_blind_frames += 1
+                self.target_turn = self.apex_turn
+                self.target_speed = LANE_SPEED_ONE_LINE
+                self.lane_lost_frame_count = 0
+            else:
+                # Either we weren't mid-apex, or the apex sweep has gone on
+                # longer than expected and something else is wrong - fall
+                # back to holding the last steering command and easing off
+                # speed the longer this persists.
+                self.apex_active = False
+                self.lane_lost_frame_count += 1
+                self.target_speed = (LANE_SPEED_LOST_SHORT
+                         if self.lane_lost_frame_count <= LANE_LOST_GRACE_FRAMES
+                         else LANE_SPEED_LOST_LONG)
             # last_target_x intentionally left unchanged - preserves
             # continuity for when a boundary reappears.
 
@@ -299,38 +327,58 @@ class LineFollower(Node):
 
         candidates = []
         if count >= 1:
-            candidates.append((message.vector_1[0].x + message.vector_1[1].x) / 2.0)
+            candidates.append(message.vector_1)
         if count >= 2:
-            candidates.append((message.vector_2[0].x + message.vector_2[1].x) / 2.0)
+            candidates.append(message.vector_2)
 
         # Among detected boundaries, find the one on the side we've committed
         # to. Deliberately NOT "whichever is closer" - once committed at a
         # split, stick to that side even if the other briefly appears too, so
         # we don't flip-flop mid-intersection.
-        target_mid_x = None
-        for mid_x in candidates:
+        target_vec = None
+        for v in candidates:
+            mid_x = (v[0].x + v[1].x) / 2.0
             if self.follow_side == "LEFT" and mid_x < half_width:
-                target_mid_x = mid_x
+                target_vec = v
                 break
             if self.follow_side == "RIGHT" and mid_x >= half_width:
-                target_mid_x = mid_x
+                target_vec = v
                 break
 
-        if target_mid_x is not None:
-            if self.follow_side == "LEFT":
-                too_close = target_mid_x > (half_width - LINE_GAP_PX)
-            else:
-                too_close = target_mid_x < (half_width + LINE_GAP_PX)
+        if target_vec is not None:
+            p0, p1 = target_vec[0], target_vec[1]
+            dx = abs(p0.x - p1.x)
+            dy = abs(p0.y - p1.y)
+            mid_x = (p0.x + p1.x) / 2.0
 
-            self.target_turn = -1 * sign * (LINE_TURN_EASE if too_close else LINE_TURN_HOLD)
-            self.target_speed = LINE_SPEED_TRACK
+            if dx > dy * 3:
+                # Same apex signal as LANE_FOLLOW's count==1 case: the
+                # committed line itself has gone near-horizontal, meaning
+                # we're mid-apex. Hold a firm turn toward our committed side.
+                self.target_turn = sign * min(1.0, 0.1 + dx / dy * 0.1)
+                self.target_speed = LINE_SPEED_TRACK
+            else:
+                # Normal case: proportional gap-hold, identical in kind to
+                # the count==1 lane-follow logic - this is what actually
+                # fixes the "always circling" bug, since it goes to ~0 turn
+                # when we're already at the target gap instead of always
+                # commanding a fixed turn magnitude.
+                offset = width * LANE_GAP_OFFSET_RATIO
+                if mid_x < half_width:
+                    target_x = mid_x + offset
+                else:
+                    target_x = mid_x - offset
+                error = half_width - target_x
+                self.target_turn = max(-1.0, min(1.0, STEER_KP * error))
+                self.target_speed = LINE_SPEED_TRACK
+
             self.line_blind_frame_count = 0
         else:
             # Committed line isn't visible this frame (e.g. turn apex). Keep
             # sweeping in the committed direction at reduced speed until it
             # reappears, rather than going straight/blind.
             self.line_blind_frame_count += 1
-            self.target_turn = -1 * sign * LINE_TURN_HOLD
+            self.target_turn = sign * LINE_TURN_HOLD
             self.target_speed = LINE_SPEED_BLIND
 
     # ------------------ Callback Implementations ------------------
