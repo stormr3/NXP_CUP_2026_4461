@@ -51,7 +51,7 @@ TURN_MAX = 1.0
 # Which mode runs on boot: "LANE_FOLLOW" (double solid lines) or
 # "LINE_FOLLOW" (single committed line, for intersections). Change this
 # constant and restart the node to switch which one you're testing.
-DEFAULT_DRIVE_MODE = "LINE_FOLLOW"
+DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
 
 # Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
 DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
@@ -81,8 +81,8 @@ LANE_APEX_BLIND_GRACE_FRAMES = 10  # frames to keep sustaining the apex turn aft
 LINE_GAP_PX = 40.0             # if committed line's midpoint crosses within this many px of center, we're driving over it
 LINE_TURN_HOLD = 0.45          # steer magnitude to hold a turn arc toward the committed line
 LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on top of the line
-LINE_SPEED_TRACK = 0.35        # speed while the committed line is visible and tracked
-LINE_SPEED_BLIND = 0.28        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
+LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
+LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
 
 class LineFollower(Node):
@@ -257,12 +257,12 @@ class LineFollower(Node):
 
                 if line_center_x >= half_width:
                     # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
-                    self.target_turn = (0.0+dx/dy*0.1) 
-                    self.target_speed = 0.35
+                    self.target_turn = (0.10+dx/dy*0.05) 
+                    self.target_speed = 0.70
                 else:
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
-                    self.target_turn = -(0.0+dx/dy*0.1) 
-                    self.target_speed = 0.35
+                    self.target_turn = -(0.10+dx/dy*0.05) 
+                    self.target_speed = 0.70
 
                 # Remember this as the committed apex turn - if the line
                 # vanishes entirely on the very next frame (very common right
