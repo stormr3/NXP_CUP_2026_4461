@@ -90,6 +90,7 @@ FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction 
 FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
 AVOID_TURN = 0.3
 AVOID_SPEED = 0.3
+AVOID_RECOVERY_FRAMES = 30  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
     """
@@ -163,6 +164,8 @@ class LineFollower(Node):
 
         # State variables (You can add your own state flags / state machines here)
         self.obstacle_in_front = False
+        self.recovery_frames_remaining = 0   # ← ADD THIS LINE
+        self.last_avoid_turn = 0.0         # ← ADD THIS LINE
         self.patient_id = None
         self.hospital_id = None
         self.current_destination = None
@@ -409,37 +412,45 @@ class LineFollower(Node):
             self._handle_line_follow(message, width, half_width)
 
     def lidar_callback(self, message):
-        """
-        Receives LIDAR range measurements and steers around obstacles that
-        appear in the front sector, deferring to lane-following otherwise.
-        """
         num_readings = len(message.ranges)
         if num_readings == 0:
             return
-
+    
         front_start = int(num_readings * FRONT_SECTOR_START_FRAC)
         front_end = int(num_readings * FRONT_SECTOR_END_FRAC)
         front_sector = message.ranges[front_start:front_end]
-
+    
         def valid(ranges):
             return [r for r in ranges if message.range_min <= r <= message.range_max]
-
+    
         front_valid = valid(front_sector)
         min_front_dist = min(front_valid) if front_valid else float('inf')
-
-        self.obstacle_in_front = min_front_dist < OBSTACLE_DISTANCE_THRESHOLD
-        if not self.obstacle_in_front:
-            return
-
-        mid = len(front_sector) // 2
-        right_valid = valid(front_sector[:mid])
-        left_valid = valid(front_sector[mid:])
-
-        left_clearance = min(left_valid) if left_valid else float('inf')
-        right_clearance = min(right_valid) if right_valid else float('inf')
-
-        turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
-        self.rover_move_manual_mode(AVOID_SPEED, turn)
+    
+        if min_front_dist < OBSTACLE_DISTANCE_THRESHOLD:
+            # Obstacle actively present → dodge
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES  # reset timer
+    
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
+            self.last_avoid_turn = turn        # ← ADD THIS LINE (remember which way we dodged)
+            self.rover_move_manual_mode(AVOID_SPEED, turn)
+    
+        elif self.recovery_frames_remaining > 0:
+            # Obstacle gone but recovery window active → steer back to opposite side
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining -= 1
+            recovery_turn = -self.last_avoid_turn * 1   # opposite of dodge, half magnitude
+            self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
+    
+        else:
+            # Fully clear → hand back to camera
+            self.obstacle_in_front = False
 
     def server_communication_callback(self, message):
         """
