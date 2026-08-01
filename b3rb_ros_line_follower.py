@@ -54,7 +54,7 @@ TURN_MAX = 1.0
 DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
 
 # Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
-DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
+DEFAULT_FOLLOW_SIDE = "RIGHT"   # "LEFT" or "RIGHT"
 
 # Same Kp and offset ratio as your original working lane follower - unchanged.
 STEER_KP = 0.004
@@ -90,7 +90,7 @@ FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction 
 FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
 AVOID_TURN = 0.3
 AVOID_SPEED = 0.3
-AVOID_RECOVERY_FRAMES = 30  # ~1.2s at 10Hz; camera blocked after obstacle clears
+AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
     """
@@ -166,6 +166,7 @@ class LineFollower(Node):
         self.obstacle_in_front = False
         self.recovery_frames_remaining = 0   # ← ADD THIS LINE
         self.last_avoid_turn = 0.0         # ← ADD THIS LINE
+        self.frames_avoided = 0          # ← ADD THIS LINE
         self.patient_id = None
         self.hospital_id = None
         self.current_destination = None
@@ -427,9 +428,10 @@ class LineFollower(Node):
         min_front_dist = min(front_valid) if front_valid else float('inf')
     
         if min_front_dist < OBSTACLE_DISTANCE_THRESHOLD:
-            # Obstacle actively present → dodge
+            # Actively dodging
             self.obstacle_in_front = True
-            self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES  # reset timer
+            self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES
+            self.frames_avoided += 1                          # count how long we dodged
     
             mid = len(front_sector) // 2
             right_valid = valid(front_sector[:mid])
@@ -438,19 +440,39 @@ class LineFollower(Node):
             right_clearance = min(right_valid) if right_valid else float('inf')
     
             turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
-            self.last_avoid_turn = turn        # ← ADD THIS LINE (remember which way we dodged)
+            self.last_avoid_turn = turn
             self.rover_move_manual_mode(AVOID_SPEED, turn)
     
         elif self.recovery_frames_remaining > 0:
-            # Obstacle gone but recovery window active → steer back to opposite side
+            # Recovery: check if return path is clear first
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            return_dir = -self.last_avoid_turn   # opposite of dodge
+            return_blocked = (
+                (return_dir > 0 and min(left_valid)  < OBSTACLE_DISTANCE_THRESHOLD if left_valid  else False) or
+                (return_dir < 0 and min(right_valid) < OBSTACLE_DISTANCE_THRESHOLD if right_valid else False)
+            )
+    
             self.obstacle_in_front = True
             self.recovery_frames_remaining -= 1
-            recovery_turn = -self.last_avoid_turn * 1   # opposite of dodge, half magnitude
-            self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
+    
+            if return_blocked:
+                # Next cone is in return path → go straight, don't jiggle
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, 0.0)
+            else:
+                # Variable recovery: proportional to how long we actually dodged
+                scale = min(self.frames_avoided / AVOID_RECOVERY_FRAMES, 1.0)
+                recovery_turn = -self.last_avoid_turn * scale * 2
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
     
         else:
-            # Fully clear → hand back to camera
+            # Fully clear → reset everything, hand back to camera
             self.obstacle_in_front = False
+            self.frames_avoided = 0              # reset for next obstacle
 
     def server_communication_callback(self, message):
         """
