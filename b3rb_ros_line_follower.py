@@ -1,3 +1,4 @@
+
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
 #
@@ -84,6 +85,12 @@ LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on t
 LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
 LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
+# Obstacle avoidance tuning
+OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this range
+FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction of the full 360 scan
+FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
+AVOID_TURN = 0.3
+AVOID_SPEED = 0.3
 
 class LineFollower(Node):
     """
@@ -166,6 +173,18 @@ class LineFollower(Node):
         self.apex_active = False   # True if the line vanished WHILE it was in apex/horizontal orientation
         self.apex_turn = 0.0       # the turn command to sustain while apex_active
         self.apex_blind_frames = 0
+
+        # ===== SERVER COMMUNICATION STATE (added) =====
+        # Translate between the server's single-letter codes and building names.
+        self.sign_to_building = {
+            'A': 'PATIENT_1', 'B': 'PATIENT_2', 'C': 'PATIENT_3',
+            'X': 'HOSPITAL_1', 'Y': 'HOSPITAL_2', 'Z': 'HOSPITAL_3',
+        }
+        self.building_to_sign = {v: k for k, v in self.sign_to_building.items()}
+        self.server_uid = 0          # rolling message id, 0-255
+        self.last_sent_qr = None     # avoid re-registering the same building repeatedly
+        self.awaiting_hospital = False
+        # ===== END SERVER STATE =====
 
         # ---- Driving mode ----
         # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
@@ -384,6 +403,10 @@ class LineFollower(Node):
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
+        if self.obstacle_in_front:
+            # LIDAR has priority while dodging; don't fight the avoidance maneuver.
+            return
+
         """
         Receives lane boundaries from the camera vector extractor and
         dispatches to whichever mode is active (see drive_mode / follow_side).
@@ -400,58 +423,113 @@ class LineFollower(Node):
 
     def lidar_callback(self, message):
         """
-        Receives LIDAR range measurements.
-
-        GUIDELINE (Obstacle Avoidance & Building Range):
-        - `message.ranges` is an array of distances in meters around the buggy.
-        - The laser scans cover 360 degrees. Find which indices correspond to the front of the buggy.
-        - If a range value in the front sector is below a threshold (e.g. 0.8m), flag an obstacle.
-        - Write obstacle avoidance maneuvers (e.g. stop, steer left/right around the block, and merge back).
-        - Use LIDAR side-ranges to verify distance to building/QR signs before patient pickup/hospital drop actions.
+        Receives LIDAR range measurements and steers around obstacles that
+        appear in the front sector, deferring to lane-following otherwise.
         """
-        # HINTS:
-        # num_readings = len(message.ranges)
-        # front_sector = message.ranges[int(num_readings * 7/18): int(num_readings * 11/18)]
-        # min_front_dist = min(front_sector)
-        pass
+        num_readings = len(message.ranges)
+        if num_readings == 0:
+            return
+
+        front_start = int(num_readings * FRONT_SECTOR_START_FRAC)
+        front_end = int(num_readings * FRONT_SECTOR_END_FRAC)
+        front_sector = message.ranges[front_start:front_end]
+
+        def valid(ranges):
+            return [r for r in ranges if message.range_min <= r <= message.range_max]
+
+        front_valid = valid(front_sector)
+        min_front_dist = min(front_valid) if front_valid else float('inf')
+
+        self.obstacle_in_front = min_front_dist < OBSTACLE_DISTANCE_THRESHOLD
+        if not self.obstacle_in_front:
+            return
+
+        mid = len(front_sector) // 2
+        right_valid = valid(front_sector[:mid])
+        left_valid = valid(front_sector[mid:])
+
+        left_clearance = min(left_valid) if left_valid else float('inf')
+        right_clearance = min(right_valid) if right_valid else float('inf')
+
+        turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
+        self.rover_move_manual_mode(AVOID_SPEED, turn)
 
     def server_communication_callback(self, message):
         """
         Receives coordination commands from the server.
 
-        GUIDELINE (Server Communication):
-        - Check if the message is destined for the Buggy (`message.dest == 1`).
-		- Do not forget to check for ACK messages from server
-        - The server communicates mission info in the `message.msg` payload string.
-        - Parse server instructions (e.g., patient pickup, target hospitals).
-        - Call `self.send_server_update` to report your status when you reach a checkpoint.
+        Protocol:
+        - Ignore anything not addressed to the buggy (dest != 1).
+        - ack == 1 means the server is just confirming receipt of one of our
+          messages; log it and stop.
+        - Otherwise the server is sending a target letter in `msg`. Store the
+          building as our current destination and ACK it back with the SAME
+          uid, or the server retries 5x then declares "Connection Lost".
         """
-        if message.dest == 1:
-            self.get_logger().info(f"Received Server Message: {message.msg}")
-            # Parse payload and update state machine destination/objectives here
-            pass
+        if message.dest != 1:
+            return
+
+        if message.ack == 1:
+            self.get_logger().info(f"Server ACKed uid={message.uid}")
+            return
+
+        target_letter = message.msg.strip()
+        building = self.sign_to_building.get(target_letter)
+        if building is not None:
+            self.current_destination = building
+            self.awaiting_hospital = False
+            self.get_logger().info(f"New destination: {building} (letter '{target_letter}')")
+            self.send_server_ack(message.uid)
 
     def send_server_update(self, text_msg):
-        """Sends status messages to the server. (Do not forget to send ACK messages to server)"""
+        """Sends a data message to the server with a proper rolling uid."""
         server_msg = ServerCommunication()
         server_msg.src = 1       # Source component: Buggy-1
         server_msg.dest = 2      # Destination component: Server-2
-        server_msg.uid = 100     # Replace with a rolling message ID/counter
+        server_msg.uid = self.server_uid
         server_msg.ack = 0
         server_msg.msg = text_msg
         self.publisher_server.publish(server_msg)
+        self.server_uid = (self.server_uid + 1) % 256
+
+    def send_server_ack(self, uid):
+        """Sends an ack=1 back to the server with its uid to confirm receipt."""
+        server_msg = ServerCommunication()
+        server_msg.src = 1       # Source component: Buggy-1
+        server_msg.dest = 2      # Destination component: Server-2
+        server_msg.uid = uid
+        server_msg.ack = 1
+        server_msg.msg = ""
+        self.publisher_server.publish(server_msg)
+        self.get_logger().info(f"Sent ACK for uid={uid}")
 
     def qr_detection_callback(self, message):
         """
-        Receives QR codes scanned from the buildings.
-
-        GUIDELINE (Patient/Hospital Identification):
-        - Parse the decoded string payload in `message.data` (e.g. "PATIENT_A", "HOSPITAL_B").
-        - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
-          perform the action (pick patient / drop patient), and communicate the arrival to the server.
+        Receives QR codes scanned from the buildings. When a recognized
+        building QR is read AND LIDAR reports we're close to it (obstacle_in_front
+        used as an in-zone proxy), register the building with the server.
         """
-        self.get_logger().info(f"Heard QR code: {message.data}")
-        pass
+        data = message.data.strip()
+        self.get_logger().info(f"Heard QR code: {data}")
+
+        building = None
+        for name in self.building_to_sign:
+            if name in data:
+                building = name
+                break
+
+        if building is None or building == self.last_sent_qr:
+            return
+
+        # Zone proxy: only register when LIDAR says we're up against the building.
+        if not self.obstacle_in_front:
+            return
+
+        letter = self.building_to_sign[building]
+        self.send_server_update(letter)
+        self.last_sent_qr = building
+        self.awaiting_hospital = True
+        self.get_logger().info(f"Registered {building} (sent '{letter}') to server.")
 
     def sign_board_callback(self, message):
         """
