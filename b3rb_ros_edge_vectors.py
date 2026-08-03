@@ -16,6 +16,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float32
 import numpy as np
 import cv2
 import math
@@ -32,6 +33,12 @@ GREEN_COLOR = (0, 255, 0)
 # Lower portions are closer to the buggy, while upper portions see further ahead.
 VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.4
 VECTOR_MAGNITUDE_MINIMUM = 2.25
+
+# ---- Green target box fallback (used only when vector_count == 0) ----
+GREEN_LOWER = np.array([35, 40, 40])
+GREEN_UPPER = np.array([85, 255, 255])
+MIN_GREEN_AREA = 400          # tune against real frame size / distance to box
+GREEN_NOT_FOUND = -999.0      # sentinel published when no box is found
 
 class EdgeVectorsPublisher(Node):
     """
@@ -66,6 +73,12 @@ class EdgeVectorsPublisher(Node):
             "/debug_images/vector_image",
             QOS_PROFILE_DEFAULT)
 
+        # Publisher for green target box offset (fallback when no lane lines found).
+        self.publisher_green_target = self.create_publisher(
+            Float32,
+            '/green_target_offset',
+            QOS_PROFILE_DEFAULT)
+
         self.image_height = 0
         self.image_width = 0
         self.lower_image_height = 0
@@ -87,6 +100,44 @@ class EdgeVectorsPublisher(Node):
             slope = (vector[1][1] - vector[0][1]) / (vector[0][0] - vector[1][0])
             theta = math.atan(slope)
         return theta
+
+    def detect_green_box(self, image):
+        """
+        Scans the FULL (uncropped) camera image for a rectangular green
+        region and returns its centroid as a normalized x-offset in [-1, 1],
+        or None if nothing is found. Only called as a fallback when
+        vector_count == 0 (no lane lines detected this frame).
+        """
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+
+        best_contour, best_area = None, 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < MIN_GREEN_AREA:
+                continue
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4 and area > best_area:   # rectangular check
+                best_contour, best_area = c, area
+
+        if best_contour is None:
+            return None
+
+        M = cv2.moments(best_contour)
+        if M['m00'] == 0:
+            return None
+        cx = M['m10'] / M['m00']
+
+        image_width = image.shape[1]
+        offset = (cx - image_width / 2) / (image_width / 2)   # -1 (left) .. +1 (right)
+        return float(np.clip(offset, -1.0, 1.0))
 
     def compute_vectors_from_image(self, image, thresh):
         """
@@ -225,6 +276,16 @@ class EdgeVectorsPublisher(Node):
             vectors_message.vector_2[1].x = float(vectors[1][1][0])
             vectors_message.vector_2[1].y = float(vectors[1][1][1])
             vectors_message.vector_count += 1
+
+        # Fallback: no lane lines found this frame - check for a green target box
+        # in the FULL camera image and publish its offset so the line follower
+        # can steer toward it instead of blindly holding the last turn.
+        if vectors_message.vector_count == 0:
+            green_offset = self.detect_green_box(image)
+            if green_offset is not None:
+                self.publisher_green_target.publish(Float32(data=green_offset))
+            else:
+                self.publisher_green_target.publish(Float32(data=GREEN_NOT_FOUND))
 
         self.publisher_edge_vectors.publish(vectors_message)
 
