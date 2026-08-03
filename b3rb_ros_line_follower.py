@@ -18,7 +18,7 @@ from rclpy.node import Node
 import time
 import math
 from sensor_msgs.msg import Joy, LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
 QOS_PROFILE_DEFAULT = 10
@@ -75,6 +75,7 @@ LANE_SPEED_ONE_LINE = 0.35     # only one boundary in play (either genuinely one
 LANE_SPEED_LOST_SHORT = 0.30   # briefly no boundary at all: hold last turn, ease off speed
 LANE_SPEED_LOST_LONG = 0.15    # lost for a while: crawl instead of driving blind at speed
 LANE_LOST_GRACE_FRAMES = 5     # frames before dropping from LOST_SHORT to LOST_LONG speed
+LANE_TURN_DECAY_FRAMES = 10    # frames over which turn ramps down to 0 (straight) once past grace
 LANE_APEX_BLIND_GRACE_FRAMES = 10  # frames to keep sustaining the apex turn after the line vanishes mid-apex, before giving up and falling back to generic lost-line handling
 
 # LINE_FOLLOW speeds/behavior (single committed line, e.g. through an intersection)
@@ -101,6 +102,14 @@ AVOID_SPEED = 0.3
 BLIND_APPROACH_DURATION = 4.5   # seconds to keep driving after QR was last seen
 
 AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
+
+# ---- Green target box fallback (mirrors edge_vectors_publisher.py) ----
+# When vector_count == 0 AND we're not mid-apex, edge_vectors_publisher scans
+# the full camera frame for a rectangular green box and publishes its offset
+# here. If found, we steer toward it instead of just holding the last turn.
+GREEN_NOT_FOUND = -999.0
+GREEN_TURN_GAIN = 0.8       # tune: how sharply to steer toward the box
+GREEN_APPROACH_SPEED = 0.30 # tune: crawl speed while chasing the green box
 
 class LineFollower(Node):
     """
@@ -152,6 +161,13 @@ class LineFollower(Node):
             self.sign_board_callback,
             QOS_PROFILE_DEFAULT)
 
+        # 6. Green Target Box offset (from edge_vectors_publisher, fallback for vector_count == 0)
+        self.subscription_green_target = self.create_subscription(
+            Float32,
+            '/green_target_offset',
+            self.green_target_callback,
+            QOS_PROFILE_DEFAULT)
+
         # ------------------ Publishers ------------------
 
         # Publisher to drive/steer the buggy
@@ -177,6 +193,7 @@ class LineFollower(Node):
         self.recovery_frames_remaining = 0   # ← ADD THIS LINE
         self.last_avoid_turn = 0.0         # ← ADD THIS LINE
         self.frames_avoided = 0          # ← ADD THIS LINE
+        self.green_offset = GREEN_NOT_FOUND   # ← ADD THIS LINE
         self.patient_id = None
         self.hospital_id = None
         self.current_destination = None
@@ -382,16 +399,33 @@ class LineFollower(Node):
                 self.target_turn = self.apex_turn
                 self.target_speed = LANE_SPEED_ONE_LINE
                 self.lane_lost_frame_count = 0
+            elif self.green_offset != GREEN_NOT_FOUND:
+                # No lane lines AND not mid-apex - but a green target box IS
+                # visible somewhere in the full camera frame (published by
+                # edge_vectors_publisher). Steer toward its centre instead of
+                # blindly holding the last turn / crawling.
+                self.apex_active = False
+                self.target_turn = max(-1.0, min(1.0, self.green_offset * GREEN_TURN_GAIN))
+                self.target_speed = GREEN_APPROACH_SPEED
+                self.lane_lost_frame_count = 0
             else:
                 # Either we weren't mid-apex, or the apex sweep has gone on
-                # longer than expected and something else is wrong - fall
-                # back to holding the last steering command and easing off
-                # speed the longer this persists.
+                # longer than expected and something else is wrong. Hold the
+                # last steering command for a brief grace window (genuinely
+                # useful for a 1-2 frame blank), then DECAY it toward 0
+                # (straight) the longer we stay lost - holding a nonzero
+                # turn forever would otherwise spiral the buggy in one
+                # direction indefinitely instead of going straight.
                 self.apex_active = False
                 self.lane_lost_frame_count += 1
-                self.target_speed = (LANE_SPEED_LOST_SHORT
-                         if self.lane_lost_frame_count <= LANE_LOST_GRACE_FRAMES
-                         else LANE_SPEED_LOST_LONG)
+
+                if self.lane_lost_frame_count <= LANE_LOST_GRACE_FRAMES:
+                    self.target_speed = LANE_SPEED_LOST_SHORT
+                else:
+                    frames_past_grace = self.lane_lost_frame_count - LANE_LOST_GRACE_FRAMES
+                    decay = max(0.0, 1.0 - (frames_past_grace / LANE_TURN_DECAY_FRAMES))
+                    self.target_turn *= decay   # ramps to 0.0 = straight
+                    self.target_speed = LANE_SPEED_LOST_LONG
             # last_target_x intentionally left unchanged - preserves
             # continuity for when a boundary reappears.
 
@@ -482,6 +516,11 @@ class LineFollower(Node):
             self._handle_lane_follow(message, width, half_width)
         elif self.drive_mode == "LINE_FOLLOW":
             self._handle_line_follow(message, width, half_width)
+
+    def green_target_callback(self, message):
+        """Stores the latest green target box offset published by
+        edge_vectors_publisher (GREEN_NOT_FOUND if no box is visible)."""
+        self.green_offset = message.data
 
     def lidar_callback(self, message):
         num_readings = len(message.ranges)
