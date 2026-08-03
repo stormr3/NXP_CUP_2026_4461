@@ -1,3 +1,4 @@
+
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
 #
@@ -176,6 +177,18 @@ class LineFollower(Node):
         self.apex_active = False   # True if the line vanished WHILE it was in apex/horizontal orientation
         self.apex_turn = 0.0       # the turn command to sustain while apex_active
         self.apex_blind_frames = 0
+
+        # ===== SERVER COMMUNICATION STATE (added) =====
+        # Translate between the server's single-letter codes and building names.
+        self.sign_to_building = {
+            'A': 'PATIENT_1', 'B': 'PATIENT_2', 'C': 'PATIENT_3',
+            'X': 'HOSPITAL_1', 'Y': 'HOSPITAL_2', 'Z': 'HOSPITAL_3',
+        }
+        self.building_to_sign = {v: k for k, v in self.sign_to_building.items()}
+        self.server_uid = 0          # rolling message id, 0-255
+        self.last_sent_qr = None     # avoid re-registering the same building repeatedly
+        self.awaiting_hospital = False
+        # ===== END SERVER STATE =====
 
         # ---- Driving mode ----
         # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
@@ -478,39 +491,78 @@ class LineFollower(Node):
         """
         Receives coordination commands from the server.
 
-        GUIDELINE (Server Communication):
-        - Check if the message is destined for the Buggy (`message.dest == 1`).
-		- Do not forget to check for ACK messages from server
-        - The server communicates mission info in the `message.msg` payload string.
-        - Parse server instructions (e.g., patient pickup, target hospitals).
-        - Call `self.send_server_update` to report your status when you reach a checkpoint.
+        Protocol:
+        - Ignore anything not addressed to the buggy (dest != 1).
+        - ack == 1 means the server is just confirming receipt of one of our
+          messages; log it and stop.
+        - Otherwise the server is sending a target letter in `msg`. Store the
+          building as our current destination and ACK it back with the SAME
+          uid, or the server retries 5x then declares "Connection Lost".
         """
-        if message.dest == 1:
-            self.get_logger().info(f"Received Server Message: {message.msg}")
-            # Parse payload and update state machine destination/objectives here
-            pass
+        if message.dest != 1:
+            return
+
+        if message.ack == 1:
+            self.get_logger().info(f"Server ACKed uid={message.uid}")
+            return
+
+        target_letter = message.msg.strip()
+        building = self.sign_to_building.get(target_letter)
+        if building is not None:
+            self.current_destination = building
+            self.awaiting_hospital = False
+            self.get_logger().info(f"New destination: {building} (letter '{target_letter}')")
+            self.send_server_ack(message.uid)
 
     def send_server_update(self, text_msg):
-        """Sends status messages to the server. (Do not forget to send ACK messages to server)"""
+        """Sends a data message to the server with a proper rolling uid."""
         server_msg = ServerCommunication()
         server_msg.src = 1       # Source component: Buggy-1
         server_msg.dest = 2      # Destination component: Server-2
-        server_msg.uid = 100     # Replace with a rolling message ID/counter
+        server_msg.uid = self.server_uid
         server_msg.ack = 0
         server_msg.msg = text_msg
         self.publisher_server.publish(server_msg)
+        self.server_uid = (self.server_uid + 1) % 256
+
+    def send_server_ack(self, uid):
+        """Sends an ack=1 back to the server with its uid to confirm receipt."""
+        server_msg = ServerCommunication()
+        server_msg.src = 1       # Source component: Buggy-1
+        server_msg.dest = 2      # Destination component: Server-2
+        server_msg.uid = uid
+        server_msg.ack = 1
+        server_msg.msg = ""
+        self.publisher_server.publish(server_msg)
+        self.get_logger().info(f"Sent ACK for uid={uid}")
 
     def qr_detection_callback(self, message):
         """
-        Receives QR codes scanned from the buildings.
-
-        GUIDELINE (Patient/Hospital Identification):
-        - Parse the decoded string payload in `message.data` (e.g. "PATIENT_A", "HOSPITAL_B").
-        - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
-          perform the action (pick patient / drop patient), and communicate the arrival to the server.
+        Receives QR codes scanned from the buildings. When a recognized
+        building QR is read AND LIDAR reports we're close to it (obstacle_in_front
+        used as an in-zone proxy), register the building with the server.
         """
-        self.get_logger().info(f"Heard QR code: {message.data}")
-        pass
+        data = message.data.strip()
+        self.get_logger().info(f"Heard QR code: {data}")
+
+        building = None
+        for name in self.building_to_sign:
+            if name in data:
+                building = name
+                break
+
+        if building is None or building == self.last_sent_qr:
+            return
+
+        # Zone proxy: only register when LIDAR says we're up against the building.
+        if not self.obstacle_in_front:
+            return
+
+        letter = self.building_to_sign[building]
+        self.send_server_update(letter)
+        self.last_sent_qr = building
+        self.awaiting_hospital = True
+        self.get_logger().info(f"Registered {building} (sent '{letter}') to server.")
 
     def sign_board_callback(self, message):
         """
