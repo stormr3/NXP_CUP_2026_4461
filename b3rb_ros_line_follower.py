@@ -54,7 +54,7 @@ TURN_MAX = 1.0
 DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
 
 # Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
-DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
+DEFAULT_FOLLOW_SIDE = "RIGHT"   # "LEFT" or "RIGHT"
 
 # Same Kp and offset ratio as your original working lane follower - unchanged.
 STEER_KP = 0.004
@@ -84,6 +84,13 @@ LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on t
 LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
 LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
+# Obstacle avoidance tuning
+OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this range
+FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction of the full 360 scan
+FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
+AVOID_TURN = 0.3
+AVOID_SPEED = 0.3
+AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
     """
@@ -157,6 +164,9 @@ class LineFollower(Node):
 
         # State variables (You can add your own state flags / state machines here)
         self.obstacle_in_front = False
+        self.recovery_frames_remaining = 0   # ← ADD THIS LINE
+        self.last_avoid_turn = 0.0         # ← ADD THIS LINE
+        self.frames_avoided = 0          # ← ADD THIS LINE
         self.patient_id = None
         self.hospital_id = None
         self.current_destination = None
@@ -384,6 +394,10 @@ class LineFollower(Node):
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
+        if self.obstacle_in_front:
+            # LIDAR has priority while dodging; don't fight the avoidance maneuver.
+            return
+
         """
         Receives lane boundaries from the camera vector extractor and
         dispatches to whichever mode is active (see drive_mode / follow_side).
@@ -399,21 +413,66 @@ class LineFollower(Node):
             self._handle_line_follow(message, width, half_width)
 
     def lidar_callback(self, message):
-        """
-        Receives LIDAR range measurements.
-
-        GUIDELINE (Obstacle Avoidance & Building Range):
-        - `message.ranges` is an array of distances in meters around the buggy.
-        - The laser scans cover 360 degrees. Find which indices correspond to the front of the buggy.
-        - If a range value in the front sector is below a threshold (e.g. 0.8m), flag an obstacle.
-        - Write obstacle avoidance maneuvers (e.g. stop, steer left/right around the block, and merge back).
-        - Use LIDAR side-ranges to verify distance to building/QR signs before patient pickup/hospital drop actions.
-        """
-        # HINTS:
-        # num_readings = len(message.ranges)
-        # front_sector = message.ranges[int(num_readings * 7/18): int(num_readings * 11/18)]
-        # min_front_dist = min(front_sector)
-        pass
+        num_readings = len(message.ranges)
+        if num_readings == 0:
+            return
+    
+        front_start = int(num_readings * FRONT_SECTOR_START_FRAC)
+        front_end = int(num_readings * FRONT_SECTOR_END_FRAC)
+        front_sector = message.ranges[front_start:front_end]
+    
+        def valid(ranges):
+            return [r for r in ranges if message.range_min <= r <= message.range_max]
+    
+        front_valid = valid(front_sector)
+        min_front_dist = min(front_valid) if front_valid else float('inf')
+    
+        if min_front_dist < OBSTACLE_DISTANCE_THRESHOLD:
+            # Actively dodging
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES
+            self.frames_avoided += 1                          # count how long we dodged
+    
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
+            self.last_avoid_turn = turn
+            self.rover_move_manual_mode(AVOID_SPEED, turn)
+    
+        elif self.recovery_frames_remaining > 0:
+            # Recovery: check if return path is clear first
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            return_dir = -self.last_avoid_turn   # opposite of dodge
+            return_blocked = (
+                (return_dir > 0 and min(left_valid)  < OBSTACLE_DISTANCE_THRESHOLD if left_valid  else False) or
+                (return_dir < 0 and min(right_valid) < OBSTACLE_DISTANCE_THRESHOLD if right_valid else False)
+            )
+    
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining -= 1
+    
+            if return_blocked:
+                # Next cone is in return path → go straight, don't jiggle
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, 0.0)
+            else:
+                # Variable recovery: proportional to how long we actually dodged
+                scale = min(self.frames_avoided / AVOID_RECOVERY_FRAMES, 1.0)
+                recovery_turn = -self.last_avoid_turn * scale * 2
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
+    
+        else:
+            # Fully clear → reset everything, hand back to camera
+            self.obstacle_in_front = False
+            self.frames_avoided = 0              # reset for next obstacle
 
     def server_communication_callback(self, message):
         """
