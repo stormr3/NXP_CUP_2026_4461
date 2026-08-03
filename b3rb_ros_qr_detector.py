@@ -22,10 +22,10 @@ import numpy as np
 # HINT: If you want to use pyzbar for QR code detection, you can install it using:
 # pip install pyzbar
 # And uncomment/import it here:
-# try:
-#     from pyzbar import pyzbar
-# except ImportError:
-#     pyzbar = None
+try:
+    from pyzbar import pyzbar
+except ImportError:
+    pyzbar = None
 
 class QRDetector(Node):
     """
@@ -85,10 +85,10 @@ class QRDetector(Node):
             self.get_logger().debug(f"OpenCV QR Detection failed: {e}")
 
         # --- Method 2: Placeholder for Pyzbar ---
-        # if pyzbar is not None:
-        #     decoded_objects = pyzbar.decode(image)
-        #     for obj in decoded_objects:
-        #         return obj.data.decode('utf-8')
+        if pyzbar is not None:
+            decoded_objects = pyzbar.decode(image)
+            for obj in decoded_objects:
+                return obj.data.decode('utf-8')
 
         return None
 

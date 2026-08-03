@@ -20,18 +20,50 @@ import cv2
 import numpy as np
 import os
 
-# HINT: TensorFlow/Keras can be heavy and might not be installed by default.
-# We wrap the import in a try-except block so the node runs even if TensorFlow is missing.
-# Install it using: pip install tensorflow
+# We wrap the import in a try-except so the node still starts (and logs a
+# clear reason why it's not detecting anything) if ultralytics isn't
+# installed yet, rather than crashing on launch.
+# Install with: pip install ultralytics
 try:
-    import tensorflow as tf
+    from ultralytics import YOLO
 except ImportError:
-    tf = None
+    YOLO = None
+
+# ------------------ TUNABLE PARAMETERS ------------------
+
+# Path to your trained weights file. Ultralytics training runs save this at
+# runs/detect/train/weights/best.pt by default - copy that file next to this
+# script (or update this path) after training.
+MODEL_WEIGHTS_FILENAME = 'best.pt'
+
+# Minimum confidence to trust a detection enough to act on it. Too low and
+# you'll get spurious/flickery sign calls; too high and you'll miss real
+# signs at a distance or bad angle. Starting heuristic - tune against your
+# own validation run.
+CONFIDENCE_THRESHOLD = 0.60
+
+# CLASS NAME MAPPING: your trained model's class names come from your
+# dataset's data.yaml (whatever you named the classes when labeling in
+# Roboflow) - they will NOT automatically be "LEFT"/"RIGHT"/"STRAIGHT".
+# line_follower.py's sign_board_callback checks for "LEFT"/"RIGHT"/"STRAIGHT"
+# (as substrings, case-insensitive) in whatever string this node publishes.
+# Fill this in with your actual class names once you know them - print
+# self.model.names after loading (see the log line in __init__ below) to see
+# exactly what your model calls each class.
+# In b3rb_ros_object_recog_2.py
+
+CLASS_NAME_MAP = {
+    'A': 'A', 'B': 'B', 'C': 'C',
+    'X': 'X', 'Y': 'Y', 'Z': 'Z',
+    'Left': 'LEFT', 'Right': 'RIGHT', 'Straight': 'STRAIGHT'
+}
 
 class ObjectRecognizer(Node):
     """
-    ROS 2 Node that processes raw camera images to recognize traffic sign boards.
-    It publishes the detected sign type/labels on the `/sign_board_detection` topic.
+    ROS 2 Node that processes raw camera images to recognize traffic sign
+    boards using a YOLOv8 detector, and publishes the detected sign type on
+    the `/sign_board_detection` topic (which line_follower.py already
+    subscribes to via sign_board_callback).
     """
     def __init__(self):
         super().__init__('object_recognizer')
@@ -49,29 +81,36 @@ class ObjectRecognizer(Node):
             '/sign_board_detection',
             10)
 
-        # Attempt to load the pre-trained Keras model (model.h5) located in the same directory.
+        # Attempt to load the trained YOLOv8 model located next to this file.
         self.model = None
-        if tf is not None:
-            try:
-                dir_path = os.path.dirname(os.path.abspath(__file__))
-                model_path = os.path.join(dir_path, 'model.h5')
-                if os.path.exists(model_path):
-                    self.model = tf.keras.models.load_model(model_path)
-                    self.get_logger().info(f"Loaded Keras model from {model_path}")
-                else:
-                    self.get_logger().warn(f"Model file not found at {model_path}")
-            except Exception as e:
-                self.get_logger().error(f"Failed to load Keras model: {e}")
+        if YOLO is not None:
+            dir_path = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(dir_path, MODEL_WEIGHTS_FILENAME)
+            if os.path.exists(model_path):
+                try:
+                    self.model = YOLO(model_path)
+                    self.get_logger().info(f"Loaded YOLO model from {model_path}")
+                    # This prints exactly what your model calls each class -
+                    # use it to fill in CLASS_NAME_MAP above correctly.
+                    self.get_logger().info(f"Model class names: {self.model.names}")
+                except Exception as e:
+                    self.get_logger().error(f"Failed to load YOLO model: {e}")
+            else:
+                self.get_logger().warn(f"Model file not found at {model_path}")
         else:
-            self.get_logger().warn("TensorFlow is not installed. Running in CV/Placeholder mode.")
+            self.get_logger().warn(
+                "ultralytics is not installed (pip install ultralytics). "
+                "Object recognizer will not detect anything until it is."
+            )
 
         self.get_logger().info("Object Recognizer Node started. Waiting for images...")
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames to classify traffic signs."""
-        # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return
 
         sign_detected = self.classify_sign(image)
 
@@ -81,37 +120,60 @@ class ObjectRecognizer(Node):
             self.publisher_sign.publish(msg)
             self.get_logger().info(f"Detected Sign Board: {sign_detected}")
 
+
+
     def classify_sign(self, image):
         """
-        Classify traffic sign boards.
-        
-        OPTIMIZATION HINTS:
-        - If TensorFlow is installed, you can pre-process the image (e.g. crop the sign region, 
-          resize to 150x150, normalize, expand dimensions) and feed it into `self.model.predict()`.
-        - Alternatively, you can use classic Computer Vision techniques:
-          1. Color Segmentation: Convert to HSV and threshold for specific sign colors.
-          2. Shape Detection: Find contours and approximate polygons.
-          3. Template Matching: Match regions of interest against template images of sign boards.
+        Detects multiple classes, separates targets (letters) from directions,
+        and pairs them based on physical proximity in the bounding boxes.
+        Publishes a formatted string like: "A:LEFT, B:STRAIGHT"
         """
-        # Example Keras model prediction template:
-        if self.model is not None:
-            try:
-                # Resize image to match model input dimensions (e.g., 150x150)
-                resized_image = cv2.resize(image, (150, 150))
-                # Add batch dimension
-                image_array = np.expand_dims(resized_image, axis=0) / 255.0  # Normalized
-                
-                predictions = self.model.predict(image_array, verbose=0)
-                # Parse predictions based on your model's classification classes
-                # Example:
-                # class_idx = np.argmax(predictions[0])
-                # if class_idx == 0:
-                #     return "STOP_SIGN"
-            except Exception as e:
-                self.get_logger().debug(f"Inference failed: {e}")
+        if self.model is None:
+            return None
 
-        # Basic OpenCV color/shape detection placeholder code:        
-        return None
+        results = self.model(image, verbose=False)
+        if not results or len(results[0].boxes) == 0:
+            return None
+
+        boxes = results[0].boxes
+        letters = []
+        directions = []
+
+        # 1. Gather all confident detections and their center coordinates
+        for i in range(len(boxes)):
+            conf = float(boxes.conf[i])
+            if conf < CONFIDENCE_THRESHOLD:
+                continue
+                
+            class_idx = int(boxes.cls[i])
+            class_name = self.model.names[class_idx]
+            mapped = CLASS_NAME_MAP.get(class_name)
+            
+            if not mapped:
+                continue
+
+            # Calculate the center (x, y) of the bounding box
+            x1, y1, x2, y2 = boxes.xyxy[i]
+            cx, cy = float((x1 + x2) / 2), float((y1 + y2) / 2)
+
+            if mapped in ['LEFT', 'RIGHT', 'STRAIGHT']:
+                directions.append((mapped, cx, cy))
+            else:
+                letters.append((mapped, cx, cy))
+
+        if not letters or not directions:
+            return None  # We need at least one letter and one direction to make a pair
+
+        # 2. Pair each letter with the arrow physically closest to it
+        pairs = []
+        for l_txt, lx, ly in letters:
+            # Find the direction box with the shortest distance to this letter
+            closest_dir = min(directions, key=lambda d: (d[1]-lx)**2 + (d[2]-ly)**2)
+            pairs.append(f"{l_txt}:{closest_dir[0]}")
+
+        # Returns a string like "A:LEFT,B:STRAIGHT"
+        return ",".join(pairs) if pairs else None
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -123,6 +185,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

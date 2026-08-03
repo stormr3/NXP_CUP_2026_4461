@@ -98,7 +98,7 @@ AVOID_SPEED = 0.3
 # continuous QR visibility, we time how long to keep driving (normally,
 # via lane-following) after the LAST sighting before assuming we've arrived
 # and stopping. Tune this number against your real track distances.
-BLIND_APPROACH_DURATION = 2.5   # seconds to keep driving after QR was last seen
+BLIND_APPROACH_DURATION = 4.5   # seconds to keep driving after QR was last seen
 
 
 class LineFollower(Node):
