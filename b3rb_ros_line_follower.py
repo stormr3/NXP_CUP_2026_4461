@@ -91,6 +91,16 @@ FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction 
 FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
 AVOID_TURN = 0.3
 AVOID_SPEED = 0.3
+
+# ===== QR APPROACH / STOP-IN-ZONE TIMING =====
+# The QR is mounted high on the building; as the buggy gets close, the
+# camera's fixed angle means the QR moves out of frame BEFORE the buggy has
+# actually reached the ideal stopping point. Instead of relying on
+# continuous QR visibility, we time how long to keep driving (normally,
+# via lane-following) after the LAST sighting before assuming we've arrived
+# and stopping. Tune this number against your real track distances.
+BLIND_APPROACH_DURATION = 4.5   # seconds to keep driving after QR was last seen
+
 AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
@@ -190,6 +200,14 @@ class LineFollower(Node):
         self.awaiting_hospital = False
         # ===== END SERVER STATE =====
 
+        # ===== QR APPROACH / STOP-IN-ZONE STATE (added) =====
+        self.qr_last_seen_time = None     # timestamp of most recent QR sighting
+        self.qr_approach_active = False   # True once we've seen a QR and are tracking approach
+        self.stopped_for_patient = False  # True once fully stopped and reported for this building
+        self.pending_letter = None        # letter code to send once we stop
+        self.pending_building = None      # building name matching pending_letter
+        # ===== END QR APPROACH STATE =====
+
         # ---- Driving mode ----
         # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
         # DEFAULT_FOLLOW_SIDE if testing LINE_FOLLOW) at the top of this file
@@ -218,6 +236,10 @@ class LineFollower(Node):
 
     def publish_drive_commands(self):
         """Timer callback that periodically publishes the current speed and steer command."""
+        # Check the QR blind-approach timer on every tick (10Hz), BEFORE
+        # publishing, so a stop decided this tick takes effect immediately.
+        self.check_qr_approach()
+
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  # Manual override button configuration
         msg.axes = [0.0, self.target_speed, 0.0, self.target_turn]
@@ -227,6 +249,33 @@ class LineFollower(Node):
         """Helper to immediately set control speed and steering angle."""
         self.target_speed = float(max(min(speed, SPEED_MAX), -SPEED_MAX))
         self.target_turn = float(max(min(turn, TURN_MAX), -TURN_MAX))
+
+    # ------------------ QR Approach / Stop-in-Zone Logic ------------------
+
+    def check_qr_approach(self):
+        """
+        Implements the elapsed-time stop trigger described above: once a
+        recognized building QR has been seen, keep driving normally
+        (lane-following continues to run every tick) until
+        BLIND_APPROACH_DURATION seconds have passed since the LAST sighting.
+        At that point, stop the buggy and report arrival to the server.
+        """
+        if not self.qr_approach_active or self.stopped_for_patient:
+            return  # nothing pending, or already stopped for this building
+
+        elapsed = time.time() - self.qr_last_seen_time
+
+        if elapsed >= BLIND_APPROACH_DURATION:
+            # Driven "blind" long enough since the QR left frame - assume
+            # we've reached the zone. Stop and report.
+            self.rover_move_manual_mode(0.0, 0.0)
+            self.stopped_for_patient = True
+            self.send_server_update(self.pending_letter)
+            self.last_sent_qr = self.pending_building
+            self.awaiting_hospital = True
+            self.get_logger().info(
+                f"Stopped in zone for {self.pending_building}, sent '{self.pending_letter}' to server."
+            )
 
     # ------------------ Mode: LANE_FOLLOW ------------------
 
@@ -411,6 +460,11 @@ class LineFollower(Node):
             # LIDAR has priority while dodging; don't fight the avoidance maneuver.
             return
 
+        if self.stopped_for_patient:
+            # We've deliberately stopped in the patient/hospital zone; don't
+            # let lane-following override that until we resume the mission.
+            return
+
         """
         Receives lane boundaries from the camera vector extractor and
         dispatches to whichever mode is active (see drive_mode / follow_side).
@@ -511,6 +565,15 @@ class LineFollower(Node):
         if building is not None:
             self.current_destination = building
             self.awaiting_hospital = False
+
+            # Resume driving now that the server has responded and given us
+            # the next target - clear the stop/approach state so lane
+            # following (and future QR approaches) can run again.
+            self.stopped_for_patient = False
+            self.qr_approach_active = False
+            self.pending_letter = None
+            self.pending_building = None
+
             self.get_logger().info(f"New destination: {building} (letter '{target_letter}')")
             self.send_server_ack(message.uid)
 
@@ -544,6 +607,9 @@ class LineFollower(Node):
         """
         data = message.data.strip()
         self.get_logger().info(f"Heard QR code: {data}")
+
+        if self.stopped_for_patient:
+            return  # already stopped/handling this building, ignore further reads
 
         building = None
         for name in self.building_to_sign:
