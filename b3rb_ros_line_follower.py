@@ -1,4 +1,3 @@
-
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
 #
@@ -71,8 +70,8 @@ LANE_GAP_OFFSET_RATIO = 0.4
 TRACK_WIDTH_DIVERGENCE_RATIO = 1
 
 # LANE_FOLLOW speeds
-LANE_SPEED_TWO_LINES = 0.70    # confident: both boundaries agree on a normal-width track
-LANE_SPEED_ONE_LINE = 0.35     # only one boundary in play (either genuinely one visible, or divergence fallback)
+LANE_SPEED_TWO_LINES = 1.0    # confident: both boundaries agree on a normal-width track
+LANE_SPEED_ONE_LINE = 1.0     # only one boundary in play (either genuinely one visible, or divergence fallback)
 LANE_SPEED_LOST_SHORT = 0.30   # briefly no boundary at all: hold last turn, ease off speed
 LANE_SPEED_LOST_LONG = 0.15    # lost for a while: crawl instead of driving blind at speed
 LANE_LOST_GRACE_FRAMES = 5     # frames before dropping from LOST_SHORT to LOST_LONG speed
@@ -90,7 +89,7 @@ OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this ran
 FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction of the full 360 scan
 FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of the full 360 scan
 AVOID_TURN = 0.3
-AVOID_SPEED = 0.3
+AVOID_SPEED = 0.7
 
 # ===== QR APPROACH / STOP-IN-ZONE TIMING =====
 # The QR is mounted high on the building; as the buggy gets close, the
@@ -101,7 +100,7 @@ AVOID_SPEED = 0.3
 # and stopping. Tune this number against your real track distances.
 BLIND_APPROACH_DURATION = 4.2   # seconds to keep driving after QR was last seen
 
-AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
+AVOID_RECOVERY_FRAMES = 6  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
     """
@@ -351,14 +350,20 @@ class LineFollower(Node):
                 self.horizontal_line_frames += 1
                 line_center_x = (p0.x + p1.x) / 2.0
 
+                # ===== SHARP TURN SPEED CONTROL =====
+                sharpness = min(dx / max(dy, 0.001), 10.0)
+                apex_speed = max(0.30, 0.70 - (sharpness * 0.04))
+
+                # ====================================
+
                 if line_center_x >= half_width:
                     # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
-                    self.target_turn = (0.10+dx/dy*0.05) 
-                    self.target_speed = 0.70
+                    self.target_turn = (0.33+0.006*dx/dy)
+                    self.target_speed = apex_speed     # ← dynamic, not hardcoded
                 else:
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
-                    self.target_turn = -(0.10+dx/dy*0.05) 
-                    self.target_speed = 0.70
+                    self.target_turn = -(0.33+0.006*dx/dy)
+                    self.target_speed = apex_speed     # ← dynamic, not hardcoded
 
                 # Remember this as the committed apex turn - if the line
                 # vanishes entirely on the very next frame (very common right
@@ -507,59 +512,62 @@ class LineFollower(Node):
         num_readings = len(message.ranges)
         if num_readings == 0:
             return
-    
+        
         front_start = int(num_readings * FRONT_SECTOR_START_FRAC)
         front_end = int(num_readings * FRONT_SECTOR_END_FRAC)
         front_sector = message.ranges[front_start:front_end]
-    
+        
         def valid(ranges):
             return [r for r in ranges if message.range_min <= r <= message.range_max]
-    
+        
         front_valid = valid(front_sector)
         min_front_dist = min(front_valid) if front_valid else float('inf')
-    
+        
         if min_front_dist < OBSTACLE_DISTANCE_THRESHOLD:
             # Actively dodging
             self.obstacle_in_front = True
             self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES
-            self.frames_avoided += 1                          # count how long we dodged
-    
+            self.frames_avoided += 1                         # count how long we dodged
+        
             mid = len(front_sector) // 2
             right_valid = valid(front_sector[:mid])
             left_valid = valid(front_sector[mid:])
             left_clearance = min(left_valid) if left_valid else float('inf')
             right_clearance = min(right_valid) if right_valid else float('inf')
-    
+        
             turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
             self.last_avoid_turn = turn
-            self.rover_move_manual_mode(AVOID_SPEED, turn)
-    
-        elif self.recovery_frames_remaining > 0:
+            self.target_turn = turn
+            self.target_speed = AVOID_SPEED
+        
+        elif self.recovery_frames_remaining > 0 and self.frames_avoided > 5:
+            self.get_logger().info(f"Frames avoided ={self.frames_avoided}")
             # Recovery: check if return path is clear first
             mid = len(front_sector) // 2
             right_valid = valid(front_sector[:mid])
             left_valid = valid(front_sector[mid:])
             left_clearance = min(left_valid) if left_valid else float('inf')
             right_clearance = min(right_valid) if right_valid else float('inf')
-    
+        
             return_dir = -self.last_avoid_turn   # opposite of dodge
             return_blocked = (
                 (return_dir > 0 and min(left_valid)  < OBSTACLE_DISTANCE_THRESHOLD if left_valid  else False) or
                 (return_dir < 0 and min(right_valid) < OBSTACLE_DISTANCE_THRESHOLD if right_valid else False)
             )
-    
+        
             self.obstacle_in_front = True
             self.recovery_frames_remaining -= 1
-    
+        
             if return_blocked:
                 # Next cone is in return path → go straight, don't jiggle
-                self.rover_move_manual_mode(AVOID_SPEED * 0.8, 0.0)
+                self.target_turn = 0.0
+                self.target_speed = AVOID_SPEED * 0.8
             else:
                 # Variable recovery: proportional to how long we actually dodged
                 scale = min(self.frames_avoided / AVOID_RECOVERY_FRAMES, 1.0)
                 recovery_turn = -self.last_avoid_turn * scale * 2
-                self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
-    
+                self.target_turn = recovery_turn
+                self.target_speed = AVOID_SPEED * 0.8        
         else:
             # Fully clear → reset everything, hand back to camera
             self.obstacle_in_front = False
