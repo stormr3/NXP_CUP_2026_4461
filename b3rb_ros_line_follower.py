@@ -1,3 +1,4 @@
+
 # Copyright 2024-2026 NXP
 # Copyright 2016 Open Source Robotics Foundation, Inc.
 #
@@ -54,7 +55,7 @@ TURN_MAX = 1.0
 DEFAULT_DRIVE_MODE = "LANE_FOLLOW"
 
 # Only used when DEFAULT_DRIVE_MODE == "LINE_FOLLOW": which line to commit to.
-DEFAULT_FOLLOW_SIDE = "LEFT"   # "LEFT" or "RIGHT"
+DEFAULT_FOLLOW_SIDE = "RIGHT"   # "LEFT" or "RIGHT"
 
 # Same Kp and offset ratio as your original working lane follower - unchanged.
 STEER_KP = 0.004
@@ -100,6 +101,7 @@ AVOID_SPEED = 0.3
 # and stopping. Tune this number against your real track distances.
 BLIND_APPROACH_DURATION = 4.5   # seconds to keep driving after QR was last seen
 
+AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
 class LineFollower(Node):
     """
@@ -173,6 +175,9 @@ class LineFollower(Node):
 
         # State variables (You can add your own state flags / state machines here)
         self.obstacle_in_front = False
+        self.recovery_frames_remaining = 0   # ← ADD THIS LINE
+        self.last_avoid_turn = 0.0         # ← ADD THIS LINE
+        self.frames_avoided = 0          # ← ADD THIS LINE
         self.patient_id = None
         self.hospital_id = None
         self.current_destination = None
@@ -475,37 +480,66 @@ class LineFollower(Node):
             self._handle_line_follow(message, width, half_width)
 
     def lidar_callback(self, message):
-        """
-        Receives LIDAR range measurements and steers around obstacles that
-        appear in the front sector, deferring to lane-following otherwise.
-        """
         num_readings = len(message.ranges)
         if num_readings == 0:
             return
-
+    
         front_start = int(num_readings * FRONT_SECTOR_START_FRAC)
         front_end = int(num_readings * FRONT_SECTOR_END_FRAC)
         front_sector = message.ranges[front_start:front_end]
-
+    
         def valid(ranges):
             return [r for r in ranges if message.range_min <= r <= message.range_max]
-
+    
         front_valid = valid(front_sector)
         min_front_dist = min(front_valid) if front_valid else float('inf')
-
-        self.obstacle_in_front = min_front_dist < OBSTACLE_DISTANCE_THRESHOLD
-        if not self.obstacle_in_front:
-            return
-
-        mid = len(front_sector) // 2
-        right_valid = valid(front_sector[:mid])
-        left_valid = valid(front_sector[mid:])
-
-        left_clearance = min(left_valid) if left_valid else float('inf')
-        right_clearance = min(right_valid) if right_valid else float('inf')
-
-        turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
-        self.rover_move_manual_mode(AVOID_SPEED, turn)
+    
+        if min_front_dist < OBSTACLE_DISTANCE_THRESHOLD:
+            # Actively dodging
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining = AVOID_RECOVERY_FRAMES
+            self.frames_avoided += 1                          # count how long we dodged
+    
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            turn = AVOID_TURN if left_clearance >= right_clearance else -AVOID_TURN
+            self.last_avoid_turn = turn
+            self.rover_move_manual_mode(AVOID_SPEED, turn)
+    
+        elif self.recovery_frames_remaining > 0:
+            # Recovery: check if return path is clear first
+            mid = len(front_sector) // 2
+            right_valid = valid(front_sector[:mid])
+            left_valid = valid(front_sector[mid:])
+            left_clearance = min(left_valid) if left_valid else float('inf')
+            right_clearance = min(right_valid) if right_valid else float('inf')
+    
+            return_dir = -self.last_avoid_turn   # opposite of dodge
+            return_blocked = (
+                (return_dir > 0 and min(left_valid)  < OBSTACLE_DISTANCE_THRESHOLD if left_valid  else False) or
+                (return_dir < 0 and min(right_valid) < OBSTACLE_DISTANCE_THRESHOLD if right_valid else False)
+            )
+    
+            self.obstacle_in_front = True
+            self.recovery_frames_remaining -= 1
+    
+            if return_blocked:
+                # Next cone is in return path → go straight, don't jiggle
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, 0.0)
+            else:
+                # Variable recovery: proportional to how long we actually dodged
+                scale = min(self.frames_avoided / AVOID_RECOVERY_FRAMES, 1.0)
+                recovery_turn = -self.last_avoid_turn * scale * 2
+                self.rover_move_manual_mode(AVOID_SPEED * 0.8, recovery_turn)
+    
+        else:
+            # Fully clear → reset everything, hand back to camera
+            self.obstacle_in_front = False
+            self.frames_avoided = 0              # reset for next obstacle
 
     def server_communication_callback(self, message):
         """
@@ -567,12 +601,9 @@ class LineFollower(Node):
 
     def qr_detection_callback(self, message):
         """
-        Receives QR codes scanned from the buildings. Because the camera's
-        fixed angle means the QR goes out of view before the buggy is
-        actually close enough to stop, this callback's ONLY job is
-        bookkeeping: remember which building we saw and refresh the
-        "last seen" timestamp. The actual stop-and-report decision is made
-        by check_qr_approach() based on elapsed time since this timestamp.
+        Receives QR codes scanned from the buildings. When a recognized
+        building QR is read AND LIDAR reports we're close to it (obstacle_in_front
+        used as an in-zone proxy), register the building with the server.
         """
         data = message.data.strip()
         self.get_logger().info(f"Heard QR code: {data}")
@@ -586,17 +617,18 @@ class LineFollower(Node):
                 building = name
                 break
 
-        if building is None:
+        if building is None or building == self.last_sent_qr:
             return
 
-        if building == self.last_sent_qr:
-            return  # already registered this one previously
+        # Zone proxy: only register when LIDAR says we're up against the building.
+        if not self.obstacle_in_front:
+            return
 
-        # Record/refresh this sighting - (re)starts the blind-approach clock.
-        self.qr_last_seen_time = time.time()
-        self.qr_approach_active = True
-        self.pending_letter = self.building_to_sign[building]
-        self.pending_building = building
+        letter = self.building_to_sign[building]
+        self.send_server_update(letter)
+        self.last_sent_qr = building
+        self.awaiting_hospital = True
+        self.get_logger().info(f"Registered {building} (sent '{letter}') to server.")
 
     def sign_board_callback(self, message):
         """

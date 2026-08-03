@@ -19,18 +19,18 @@ from std_msgs.msg import String
 import cv2
 import numpy as np
 
-# HINT: If you want to use pyzbar for QR code detection, you can install it using:
-# pip install pyzbar
-# And uncomment/import it here:
+# pyzbar is the primary QR reader (stronger than OpenCV's built-in).
+# Wrapped in try/except so the node still starts if pyzbar is missing.
 try:
     from pyzbar import pyzbar
 except ImportError:
     pyzbar = None
 
+
 class QRDetector(Node):
     """
     ROS 2 Node that processes raw camera images to scan for QR codes.
-    It publishes the detected QR code payload on the `/qr_detection` topic.
+    It publishes the decoded QR payload on the `/qr_detection` topic.
     """
     def __init__(self):
         super().__init__('qr_detector')
@@ -48,18 +48,19 @@ class QRDetector(Node):
             '/qr_detection',
             10)
 
+        if pyzbar is None:
+            self.get_logger().warn("pyzbar not installed — falling back to OpenCV only.")
+
         self.get_logger().info("QR Detector Node started. Waiting for images...")
 
     def camera_image_callback(self, message):
         """Processes incoming camera frames to detect QR codes."""
-        # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         qr_data = self.detect_qr_code(image)
 
         if qr_data is not None:
-            # Publish the decoded QR payload
             msg = String()
             msg.data = qr_data
             self.publisher_qr.publish(msg)
@@ -67,30 +68,32 @@ class QRDetector(Node):
 
     def detect_qr_code(self, image):
         """
-        Detect and decode QR code in the image.
-        
-        OPTIMIZATION HINTS:
-        - OpenCV has a built-in QR Code detector: cv2.QRCodeDetector().
-        - Alternatively, you can use Pyzbar (a popular and robust library for barcode/QR code reading).
-        - Ensure to pre-process the image (e.g., convert to grayscale, thresholding, cropping to region 
-          of interest where the building/QR board is expected to appear) to improve speed and reliability.
+        Detect and decode a QR code in the image.
+        Strategy: try pyzbar first (robust to angle/distance),
+        fall back to OpenCV's built-in detector if pyzbar finds nothing.
         """
-        # --- Method 1: Using OpenCV Built-in QR Detector ---
+        # QR codes are pure black/white — grayscale is faster and more reliable.
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # --- Method 1 (PRIMARY): pyzbar ---
+        if pyzbar is not None:
+            decoded_objects = pyzbar.decode(gray)
+            for obj in decoded_objects:
+                data = obj.data.decode('utf-8')
+                if data:
+                    return data
+
+        # --- Method 2 (BACKUP): OpenCV built-in ---
         try:
             detector = cv2.QRCodeDetector()
-            data, bbox, straight_qrcode = detector.detectAndDecode(image)
+            data, bbox, _ = detector.detectAndDecode(image)
             if bbox is not None and data != "":
                 return data
         except Exception as e:
             self.get_logger().debug(f"OpenCV QR Detection failed: {e}")
 
-        # --- Method 2: Placeholder for Pyzbar ---
-        if pyzbar is not None:
-            decoded_objects = pyzbar.decode(image)
-            for obj in decoded_objects:
-                return obj.data.decode('utf-8')
-
         return None
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -102,6 +105,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
