@@ -99,7 +99,7 @@ AVOID_SPEED = 0.3
 # continuous QR visibility, we time how long to keep driving (normally,
 # via lane-following) after the LAST sighting before assuming we've arrived
 # and stopping. Tune this number against your real track distances.
-BLIND_APPROACH_DURATION = 4.5   # seconds to keep driving after QR was last seen
+BLIND_APPROACH_DURATION = 4.2   # seconds to keep driving after QR was last seen
 
 AVOID_RECOVERY_FRAMES = 12  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
@@ -189,15 +189,20 @@ class LineFollower(Node):
         self.apex_blind_frames = 0
 
         # ===== SERVER COMMUNICATION STATE (added) =====
-        # Translate between the server's single-letter codes and building names.
         self.sign_to_building = {
             'A': 'PATIENT_1', 'B': 'PATIENT_2', 'C': 'PATIENT_3',
             'X': 'HOSPITAL_1', 'Y': 'HOSPITAL_2', 'Z': 'HOSPITAL_3',
         }
         self.building_to_sign = {v: k for k, v in self.sign_to_building.items()}
-        self.server_uid = 0          # rolling message id, 0-255
-        self.last_sent_qr = None     # avoid re-registering the same building repeatedly
+        self.server_uid = 0
+        self.last_sent_qr = None     
         self.awaiting_hospital = False
+        
+        self.current_destination = 'PATIENT_1' # Start by looking for Patient 1
+        self.waiting_for_ack = False
+        self.server_retries = 0
+        self.last_msg_send_time = 0.0
+        # ==============================================
         # ===== END SERVER STATE =====
 
         # ===== QR APPROACH / STOP-IN-ZONE STATE (added) =====
@@ -236,14 +241,15 @@ class LineFollower(Node):
 
     def publish_drive_commands(self):
         """Timer callback that periodically publishes the current speed and steer command."""
-        # Check the QR blind-approach timer on every tick (10Hz), BEFORE
-        # publishing, so a stop decided this tick takes effect immediately.
         self.check_qr_approach()
+        self.check_server_retries() # <--- ADD THIS LINE
 
         msg = Joy()
-        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  # Manual override button configuration
+        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1] 
         msg.axes = [0.0, self.target_speed, 0.0, self.target_turn]
         self.publisher_joy.publish(msg)
+
+    
 
     def rover_move_manual_mode(self, speed, turn):
         """Helper to immediately set control speed and steering angle."""
@@ -252,29 +258,47 @@ class LineFollower(Node):
 
     # ------------------ QR Approach / Stop-in-Zone Logic ------------------
 
+    def check_server_retries(self):
+            """Handles 5x retries at 1-second intervals using self.server_uid."""
+            if self.waiting_for_ack:
+                current_time = time.time()
+                if current_time - self.last_msg_send_time >= 1.0:
+                    if self.server_retries < 5:
+                        self.send_server_update(self.pending_letter, uid=self.server_uid)
+                        self.last_msg_send_time = current_time
+                        self.server_retries += 1
+                        self.get_logger().info(
+                            f"No ACK yet. Retry {self.server_retries}/5 for '{self.pending_letter}' (UID {self.server_uid})..."
+                        )
+                    else:
+                        self.get_logger().warn("Max server retries reached, no ACK received. Idling.")
+                        self.waiting_for_ack = False
+                        # Increment UID so the next attempt won't reuse this UID
+                        self.server_uid = (self.server_uid + 1) % 256
+
     def check_qr_approach(self):
-        """
-        Implements the elapsed-time stop trigger described above: once a
-        recognized building QR has been seen, keep driving normally
-        (lane-following continues to run every tick) until
-        BLIND_APPROACH_DURATION seconds have passed since the LAST sighting.
-        At that point, stop the buggy and report arrival to the server.
-        """
         if not self.qr_approach_active or self.stopped_for_patient:
-            return  # nothing pending, or already stopped for this building
+            return  
 
         elapsed = time.time() - self.qr_last_seen_time
 
         if elapsed >= BLIND_APPROACH_DURATION:
-            # Driven "blind" long enough since the QR left frame - assume
-            # we've reached the zone. Stop and report.
-            self.rover_move_manual_mode(0.0, 0.0)
+            self.target_speed = 0.0
+            self.target_turn = 0.0
             self.stopped_for_patient = True
-            self.send_server_update(self.pending_letter)
+            
+            # Setup server retry state
+            self.waiting_for_ack = True
+            self.server_retries = 1
+            self.last_msg_send_time = time.time()
+            
+            # Send initial message using current server_uid (without incrementing yet)
+            self.send_server_update(self.pending_letter, uid=self.server_uid)
+            
             self.last_sent_qr = self.pending_building
             self.awaiting_hospital = True
             self.get_logger().info(
-                f"Stopped in zone for {self.pending_building}, sent '{self.pending_letter}' to server."
+                f"Stopped at {self.pending_building}, sent '{self.pending_letter}' with UID {self.server_uid}."
             )
 
     # ------------------ Mode: LANE_FOLLOW ------------------
@@ -542,71 +566,68 @@ class LineFollower(Node):
             self.frames_avoided = 0              # reset for next obstacle
 
     def server_communication_callback(self, message):
-        """
-        Receives coordination commands from the server.
-
-        Protocol:
-        - Ignore anything not addressed to the buggy (dest != 1).
-        - ack == 1 means the server is just confirming receipt of one of our
-          messages; log it and stop.
-        - Otherwise the server is sending a target letter in `msg`. Store the
-          building as our current destination and ACK it back with the SAME
-          uid, or the server retries 5x then declares "Connection Lost".
-        """
+        # Ignore messages not intended for this node (dest == 1)
         if message.dest != 1:
             return
 
+        # 1. Handle incoming ACK from server (acknowledging a message WE sent)
         if message.ack == 1:
-            self.get_logger().info(f"Server ACKed uid={message.uid}")
+            if message.uid == self.server_uid:
+                self.get_logger().info(f"Server ACKed our message UID={message.uid}")
+                self.waiting_for_ack = False
+                
+                # Increment UID on successful server ACK
+                self.server_uid = (self.server_uid + 1) % 256
             return
 
+        # 2. Handle incoming target command from server (e.g., 'X', 'Y', 'Z')
         target_letter = message.msg.strip()
         building = self.sign_to_building.get(target_letter)
         if building is not None:
             self.current_destination = building
             self.awaiting_hospital = False
 
-            # Resume driving now that the server has responded and given us
-            # the next target - clear the stop/approach state so lane
-            # following (and future QR approaches) can run again.
+            # Resume driving
             self.stopped_for_patient = False
             self.qr_approach_active = False
             self.pending_letter = None
             self.pending_building = None
 
-            self.get_logger().info(f"New destination: {building} (letter '{target_letter}')")
+            self.get_logger().info(f"New destination received: {building} (letter '{target_letter}')")
+            
+            # Send ACK back to server (this will increment self.server_uid inside send_server_ack)
             self.send_server_ack(message.uid)
 
-    def send_server_update(self, text_msg):
-        """Sends a data message to the server with a proper rolling uid."""
+    def send_server_update(self, text_msg, uid):
+        """Sends a data message to the server with a specific UID."""
         server_msg = ServerCommunication()
-        server_msg.src = 1       # Source component: Buggy-1
-        server_msg.dest = 2      # Destination component: Server-2
-        server_msg.uid = self.server_uid
+        server_msg.src = 1       
+        server_msg.dest = 2      
+        server_msg.uid = uid
         server_msg.ack = 0
         server_msg.msg = text_msg
-        self.publisher_server.publish(server_msg)
-        self.server_uid = (self.server_uid + 1) % 256
 
-    def send_server_ack(self, uid):
-        """Sends an ack=1 back to the server with its uid to confirm receipt."""
+        self.publisher_server.publish(server_msg)
+
+    def send_server_ack(self, uid_to_ack):
+        """Sends an ACK message back to the server for a received command."""
         server_msg = ServerCommunication()
-        server_msg.src = 1       # Source component: Buggy-1
-        server_msg.dest = 2      # Destination component: Server-2
-        server_msg.uid = uid
+        server_msg.src = 1       
+        server_msg.dest = 2      
+        server_msg.uid = uid_to_ack  # Identifies which incoming message we are ACKing
         server_msg.ack = 1
         server_msg.msg = ""
         self.publisher_server.publish(server_msg)
-        self.get_logger().info(f"Sent ACK for uid={uid}")
+
+        # Increment UID whenever we transmit an ACK
+        self.server_uid = (self.server_uid + 1) % 256
+        self.get_logger().info(f"Sent ACK for UID={uid_to_ack}. Advanced internal server_uid to {self.server_uid}.")
 
     def qr_detection_callback(self, message):
         """
-        Receives QR codes scanned from the buildings. When a recognized
-        building QR is read AND LIDAR reports we're close to it (obstacle_in_front
-        used as an in-zone proxy), register the building with the server.
+        Receives QR codes scanned from the buildings.
         """
         data = message.data.strip()
-        self.get_logger().info(f"Heard QR code: {data}")
 
         if self.stopped_for_patient:
             return  # already stopped/handling this building, ignore further reads
@@ -617,18 +638,20 @@ class LineFollower(Node):
                 building = name
                 break
 
+        # Ignore if it's not a recognized building OR if it's the one we just did
         if building is None or building == self.last_sent_qr:
             return
 
-        # Zone proxy: only register when LIDAR says we're up against the building.
-        if not self.obstacle_in_front:
+        # NEW: Ignore if the building is NOT our current destination
+        if building != self.current_destination:
+            self.get_logger().info(f"Saw {building}, but heading to {self.current_destination}")
             return
 
-        letter = self.building_to_sign[building]
-        self.send_server_update(letter)
-        self.last_sent_qr = building
-        self.awaiting_hospital = True
-        self.get_logger().info(f"Registered {building} (sent '{letter}') to server.")
+        self.qr_last_seen_time = time.time()
+        self.qr_approach_active = True
+        self.pending_letter = self.building_to_sign[building]
+        self.pending_building = building
+        self.get_logger().info(f"Approaching target: {building}.")
 
     def sign_board_callback(self, message):
         """
