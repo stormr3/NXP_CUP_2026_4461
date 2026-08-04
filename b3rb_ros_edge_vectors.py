@@ -20,6 +20,7 @@ import numpy as np
 import cv2
 import math
 from synapse_msgs.msg import EdgeVectors
+from std_msgs.msg import String
 
 QOS_PROFILE_DEFAULT = 10
 PI = math.pi
@@ -48,6 +49,14 @@ class EdgeVectorsPublisher(Node):
             self.camera_image_callback,
             QOS_PROFILE_DEFAULT)
 
+        self.subscription_drive_mode = self.create_subscription(
+            String,
+            '/drive_mode',
+            self.drive_mode_callback,
+            QOS_PROFILE_DEFAULT)
+
+        self.current_drive_mode = "LANE_FOLLOW"
+
         # Publisher for edge vectors.
         self.publisher_edge_vectors = self.create_publisher(
             EdgeVectors,
@@ -70,6 +79,10 @@ class EdgeVectorsPublisher(Node):
         self.image_width = 0
         self.lower_image_height = 0
         self.upper_image_height = 0
+
+    def drive_mode_callback(self, msg):
+        """Updates internal drive mode state when published from main controller."""
+        self.current_drive_mode = msg.data
 
     def publish_debug_image(self, publisher, image):
         """Helper function to publish OpenCV debug images to ROS topics."""
@@ -135,7 +148,7 @@ class EdgeVectorsPublisher(Node):
 
         return vectors, image
 
-    def process_image_for_edge_vectors(self, image):
+    def process_image_for_edge_vectors(self, image, lookahead=False):
         """
         Applies basic preprocessing (Grayscale + Thresholding) and extracts lane vectors.
         
@@ -151,8 +164,6 @@ class EdgeVectorsPublisher(Node):
           (y = Ax^2 + Bx + C) to handle bends, curves, and intersections more smoothly.
         """
         self.image_height, self.image_width, _ = image.shape
-        self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
-        self.upper_image_height = int(self.image_height - self.lower_image_height)
 
         # 1. Convert to Grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -162,9 +173,24 @@ class EdgeVectorsPublisher(Node):
         threshold_black = 25
         thresh = cv2.threshold(gray, threshold_black, 255, cv2.THRESH_BINARY_INV)[1]
 
-        # 3. Crop the image to focus on the lower section close to the buggy
-        thresh_cropped = thresh[self.image_height - self.lower_image_height:]
-        image_cropped = image[self.image_height - self.lower_image_height:].copy()
+        # 3. Crop based on lookahead mode
+        if lookahead:
+            # Upper/middle slice for distant lookahead during STRAIGHT mode
+            crop_top = int(self.image_height * 0.40)
+            crop_bottom = int(self.image_height * 0.70)
+            
+            self.upper_image_height = crop_top
+            self.lower_image_height = crop_bottom - crop_top
+
+            thresh_cropped = thresh[crop_top:crop_bottom]
+            image_cropped = image[crop_top:crop_bottom].copy()
+        else:
+            # Standard mode (Exact reference cropping)
+            self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
+            self.upper_image_height = int(self.image_height - self.lower_image_height)
+
+            thresh_cropped = thresh[self.image_height - self.lower_image_height:]
+            image_cropped = image[self.image_height - self.lower_image_height:].copy()
 
         # 4. Compute vectors from the binary image contours
         vectors, debug_img = self.compute_vectors_from_image(image_cropped, thresh_cropped)
@@ -202,7 +228,9 @@ class EdgeVectorsPublisher(Node):
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        vectors = self.process_image_for_edge_vectors(image)
+        # Use lookahead mode if drive_mode is STRAIGHT
+        is_straight = (self.current_drive_mode == "STRAIGHT")
+        vectors = self.process_image_for_edge_vectors(image, lookahead=is_straight)
 
         # Construct and publish the ROS 2 EdgeVectors message
         vectors_message = EdgeVectors()
