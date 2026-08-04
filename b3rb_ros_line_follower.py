@@ -84,6 +84,41 @@ LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on t
 LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
 LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
+# ===== STRAIGHT MODE (drive through an intersection without turning) =====
+# Third drive mode. Unlike LANE_FOLLOW, the apex/horizontal-line trigger is
+# COMPLETELY SUPPRESSED here - at a crossing, the near-horizontal fillets
+# where your lane boundaries curve away into the cross street would
+# otherwise read as "sharp corner, turn now" and pull the buggy off a route
+# that was supposed to go straight through.
+STRAIGHT_SPEED = 0.55            # speed while crossing an intersection straight
+STRAIGHT_CENTERING_KP = 0.004    # gentle centering correction if a usable vertical boundary is visible
+STRAIGHT_MAX_TURN = 0.25         # hard cap on any correction while in STRAIGHT - never let it become a real turn
+STRAIGHT_VERTICAL_RATIO = 3.0    # dx <= dy * ratio counts as "vertical enough" to correct against
+
+# ===== SIGN BOARD ROUTING / MANEUVER STATE MACHINE =====
+SIGN_SET_SIZE = 6                # only act once a COMPLETE set of 6 sign entries has arrived
+SIGN_BUFFER_TIMEOUT = 3.0        # seconds; a partial (<6) buffer older than this is stale, discard it
+MANEUVER_COMPLETE_FRAMES = 3     # consecutive frames of clean 2-vertical-boundary lane needed to declare the maneuver finished
+MANEUVER_MIN_DURATION = 1.5      # seconds; ignore completion before this, so we don't "finish" instantly at the entry line
+MANEUVER_TIMEOUT = 8.0           # seconds; hard backstop - revert to LANE_FOLLOW even if completion never detected
+
+# Positional fallback: if the sign tokens carry no explicit direction word,
+# assume the 6 entries are laid out left-block / centre-block / right-block.
+#
+# >>> VERIFY THIS AGAINST A REAL `ros2 topic echo /sign_board_detection` <<<
+# This mapping is an assumption from the board layout in the screenshot, NOT
+# measured. If the real board orders its 6 tiles differently, this is the ONE
+# dict to change - nothing else in the routing logic depends on the layout.
+SIGN_POSITION_TO_DIRECTION = {
+    0: "LEFT",
+    1: "LEFT",
+    2: "STRAIGHT",
+    3: "STRAIGHT",
+    4: "RIGHT",
+    5: "RIGHT",
+}
+# ===== END SIGN BOARD ROUTING =====
+
 # Obstacle avoidance tuning
 OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this range
 FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction of the full 360 scan
@@ -105,12 +140,19 @@ AVOID_RECOVERY_FRAMES = 6  # ~1.2s at 10Hz; camera blocked after obstacle clears
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
-    Two selectable driving modes (see drive_mode / follow_side):
+    Three selectable driving modes (see drive_mode / follow_side):
       - LANE_FOLLOW: your original centering/single-line logic, extended with
         a fallback for when the two detected boundaries diverge too far to be
-        a real lane pair (tight-turn cross-edge case).
+        a real lane pair (tight-turn cross-edge case). Default cruising mode.
       - LINE_FOLLOW: commits to ONE line and holds a gap to it; if it vanishes
-        (turn apex), holds a turn arc toward it until reacquired.
+        (turn apex), holds a turn arc toward it until reacquired. Used for
+        sign-directed LEFT/RIGHT turns at intersections.
+      - STRAIGHT: crosses an intersection without turning, with the apex
+        trigger fully suppressed. Used for sign-directed STRAIGHT routing.
+
+    LINE_FOLLOW and STRAIGHT are entered by sign_board_callback when a
+    complete 6-entry sign set names a maneuver for the current destination,
+    and automatically revert to LANE_FOLLOW once the maneuver completes.
     """
     def __init__(self):
         super().__init__('line_follower')
@@ -212,12 +254,19 @@ class LineFollower(Node):
         self.pending_building = None      # building name matching pending_letter
         # ===== END QR APPROACH STATE =====
 
+        # ===== SIGN BOARD / MANEUVER STATE (added) =====
+        self.sign_buffer = []             # accumulating sign entries until we have SIGN_SET_SIZE
+        self.sign_buffer_time = 0.0       # timestamp of last entry added, for staleness expiry
+        self.maneuver_active = False      # True while executing a sign-directed LEFT/RIGHT/STRAIGHT
+        self.maneuver_direction = None    # "LEFT" / "RIGHT" / "STRAIGHT" currently being executed
+        self.maneuver_start_time = 0.0    # for MANEUVER_MIN_DURATION and MANEUVER_TIMEOUT
+        self.maneuver_confirm_frames = 0  # consecutive clean-lane frames seen so far
+        # ===== END SIGN BOARD / MANEUVER STATE =====
+
         # ---- Driving mode ----
-        # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
-        # DEFAULT_FOLLOW_SIDE if testing LINE_FOLLOW) at the top of this file
-        # and restart the node. Later, sign_board_callback can set
-        # self.drive_mode / self.follow_side directly instead.
-        self.drive_mode = DEFAULT_DRIVE_MODE      # "LANE_FOLLOW" or "LINE_FOLLOW"
+        # Set at boot from the DEFAULT_* constants; from then on
+        # sign_board_callback drives these via set_maneuver() / end_maneuver().
+        self.drive_mode = DEFAULT_DRIVE_MODE      # "LANE_FOLLOW", "LINE_FOLLOW" or "STRAIGHT"
         self.follow_side = DEFAULT_FOLLOW_SIDE    # "LEFT" or "RIGHT" (LINE_FOLLOW only)
 
         # LANE_FOLLOW bookkeeping
@@ -242,6 +291,8 @@ class LineFollower(Node):
         """Timer callback that periodically publishes the current speed and steer command."""
         self.check_qr_approach()
         self.check_server_retries() # <--- ADD THIS LINE
+        self.check_maneuver_timeout()  # backstop: runs on the timer, so it still
+                                       # fires even if EdgeVectors stops arriving
 
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1] 
@@ -300,6 +351,108 @@ class LineFollower(Node):
                 f"Stopped at {self.pending_building}, sent '{self.pending_letter}' with UID {self.server_uid}."
             )
 
+    # ------------------ Maneuver State Machine ------------------
+
+    def set_maneuver(self, direction):
+        """
+        Enters a sign-directed maneuver. Single place that flips drive_mode /
+        follow_side, so the mode can never be set inconsistently from
+        scattered call sites.
+        """
+        if direction == "STRAIGHT":
+            self.drive_mode = "STRAIGHT"
+        elif direction in ("LEFT", "RIGHT"):
+            self.drive_mode = "LINE_FOLLOW"
+            self.follow_side = direction
+        else:
+            self.get_logger().warn(f"set_maneuver: unknown direction '{direction}', ignoring.")
+            return
+
+        self.maneuver_active = True
+        self.maneuver_direction = direction
+        self.maneuver_start_time = time.time()
+        self.maneuver_confirm_frames = 0
+
+        # Clear stale apex/lost state so nothing left over from the approach
+        # leaks into the maneuver and fights it.
+        self.apex_active = False
+        self.apex_blind_frames = 0
+        self.horizontal_line_frames = 0
+        self.lane_lost_frame_count = 0
+        self.line_blind_frame_count = 0
+
+        self.get_logger().info(f"MANEUVER START: {direction} (drive_mode={self.drive_mode})")
+
+    def end_maneuver(self, reason):
+        """Reverts to normal lane following once the maneuver is done."""
+        if not self.maneuver_active:
+            return
+        self.get_logger().info(f"MANEUVER END ({self.maneuver_direction}): {reason} -> LANE_FOLLOW")
+
+        self.drive_mode = "LANE_FOLLOW"
+        self.maneuver_active = False
+        self.maneuver_direction = None
+        self.maneuver_confirm_frames = 0
+
+        # Clear apex/lost state again on exit, same reasoning as on entry.
+        self.apex_active = False
+        self.apex_blind_frames = 0
+        self.horizontal_line_frames = 0
+        self.lane_lost_frame_count = 0
+        self.line_blind_frame_count = 0
+
+    def check_maneuver_timeout(self):
+        """
+        Hard backstop, run on the 10Hz timer (NOT in edge_vectors_callback).
+        If EdgeVectors stops arriving entirely mid-maneuver, the vision-based
+        completion check below would never fire and we'd be stuck in the
+        maneuver mode forever - this guarantees an exit.
+        """
+        if not self.maneuver_active:
+            return
+        if (time.time() - self.maneuver_start_time) > MANEUVER_TIMEOUT:
+            self.end_maneuver("timeout")
+
+    def check_maneuver_complete(self, message, width, half_width):
+        """
+        Vision-based completion: we consider the maneuver finished once we're
+        back on a clean, normal lane - two boundaries, both roughly vertical,
+        a sane distance apart - for MANEUVER_COMPLETE_FRAMES in a row.
+
+        MANEUVER_MIN_DURATION guards the entry: right as we enter an
+        intersection we may still briefly see a clean lane behind/around us,
+        and completing instantly would abort the maneuver before it started.
+        """
+        if not self.maneuver_active:
+            return
+
+        if (time.time() - self.maneuver_start_time) < MANEUVER_MIN_DURATION:
+            return  # too early to call it done
+
+        if message.vector_count != 2:
+            self.maneuver_confirm_frames = 0
+            return
+
+        v1_dx = abs(message.vector_1[0].x - message.vector_1[1].x)
+        v1_dy = abs(message.vector_1[0].y - message.vector_1[1].y)
+        v2_dx = abs(message.vector_2[0].x - message.vector_2[1].x)
+        v2_dy = abs(message.vector_2[0].y - message.vector_2[1].y)
+
+        both_vertical = (v1_dx <= v1_dy * STRAIGHT_VERTICAL_RATIO
+                         and v2_dx <= v2_dy * STRAIGHT_VERTICAL_RATIO)
+
+        v1_mid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+        v2_mid_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+        sane_width = abs(v1_mid_x - v2_mid_x) <= (width * TRACK_WIDTH_DIVERGENCE_RATIO)
+
+        if both_vertical and sane_width:
+            self.maneuver_confirm_frames += 1
+        else:
+            self.maneuver_confirm_frames = 0
+
+        if self.maneuver_confirm_frames >= MANEUVER_COMPLETE_FRAMES:
+            self.end_maneuver("lane reacquired")
+
     # ------------------ Mode: LANE_FOLLOW ------------------
 
     def _handle_lane_follow(self, message, width, half_width):
@@ -356,13 +509,23 @@ class LineFollower(Node):
 
                 # ====================================
 
+                # Your tuning (0.33 + 0.006*dx/dy) kept EXACTLY as-is. The only
+                # change is dy is floored at 0.001 and the result is clamped to
+                # the valid [-1, 1] control range: at a tight apex dy can reach
+                # ~0, and this branch writes self.target_turn directly (it does
+                # NOT go through rover_move_manual_mode's clamp), so an
+                # unbounded value would be published raw into the Joy message.
+                # In your normal operating range this changes nothing.
+                apex_ratio = dx / max(dy, 0.001)
+                apex_turn_magnitude = max(-1.0, min(1.0, 0.33 + 0.006 * apex_ratio))
+
                 if line_center_x >= half_width:
                     # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
-                    self.target_turn = (0.33+0.006*dx/dy)
+                    self.target_turn = apex_turn_magnitude
                     self.target_speed = apex_speed     # ← dynamic, not hardcoded
                 else:
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
-                    self.target_turn = -(0.33+0.006*dx/dy)
+                    self.target_turn = -apex_turn_magnitude
                     self.target_speed = apex_speed     # ← dynamic, not hardcoded
 
                 # Remember this as the committed apex turn - if the line
@@ -456,7 +619,7 @@ class LineFollower(Node):
                 # Same apex signal as LANE_FOLLOW's count==1 case: the
                 # committed line itself has gone near-horizontal, meaning
                 # we're mid-apex. Hold a firm turn toward our committed side.
-                self.target_turn = sign * min(1.0, 0.1 + dx / dy * 0.1)
+                self.target_turn = sign * min(1.0, 0.1 + dx / max(dy, 0.001) * 0.1)
                 self.target_speed = LINE_SPEED_TRACK
             else:
                 # Normal case: proportional gap-hold, identical in kind to
@@ -482,6 +645,101 @@ class LineFollower(Node):
             self.target_turn = sign * LINE_TURN_HOLD
             self.target_speed = LINE_SPEED_BLIND
 
+    # ------------------ Mode: STRAIGHT ------------------
+
+    def _handle_straight(self, message, width, half_width):
+        """
+        Cross the intersection without turning.
+
+        The whole point of this mode: the apex / horizontal-line trigger is
+        NEVER consulted here. At a crossing, the rounded fillets where your
+        lane boundaries curve away into the cross street are near-horizontal
+        AND appear on both sides pointing opposite ways - so LANE_FOLLOW's
+        apex rule would pull a hard turn in whichever direction it happened
+        to detect that frame. In STRAIGHT we treat every horizontal edge as
+        paint to drive over, not as a corner.
+
+        Vertical boundaries are still used, but only for gentle centering,
+        capped at STRAIGHT_MAX_TURN so a correction can never grow into a
+        real turn.
+        """
+        count = message.vector_count
+
+        usable_mids = []
+        for i in range(count):
+            v = message.vector_1 if i == 0 else message.vector_2
+            dx = abs(v[0].x - v[1].x)
+            dy = abs(v[0].y - v[1].y)
+            if dx <= dy * STRAIGHT_VERTICAL_RATIO:      # vertical enough to trust
+                usable_mids.append((v[0].x + v[1].x) / 2.0)
+
+        if len(usable_mids) == 2:
+            # Both boundaries visible and vertical - centre between them.
+            target_x = (usable_mids[0] + usable_mids[1]) / 2.0
+            error = half_width - target_x
+            correction = STRAIGHT_CENTERING_KP * error
+        elif len(usable_mids) == 1:
+            # One vertical boundary - hold the normal offset from it.
+            offset = width * LANE_GAP_OFFSET_RATIO
+            mid_x = usable_mids[0]
+            target_x = mid_x + offset if mid_x < half_width else mid_x - offset
+            error = half_width - target_x
+            correction = STRAIGHT_CENTERING_KP * error
+        else:
+            # Nothing vertical to steer by (all horizontal fillets, or blank
+            # mid-crossing). This is the normal state in the middle of an
+            # intersection - just go straight.
+            correction = 0.0
+
+        self.target_turn = max(-STRAIGHT_MAX_TURN, min(STRAIGHT_MAX_TURN, correction))
+        self.target_speed = STRAIGHT_SPEED
+
+    # ------------------ Sign Board Parsing ------------------
+
+    def parse_sign_message(self, data):
+        """
+        Splits one incoming /sign_board_detection message into tokens.
+        Tolerant of comma, semicolon, pipe or whitespace separation, so it
+        works whether the recognizer emits "A,B,C,X,Y,Z" or "A B C X Y Z"
+        in one message, or one letter per message.
+        """
+        cleaned = data.strip().upper()
+        for sep in (',', ';', '|'):
+            cleaned = cleaned.replace(sep, ' ')
+        return [t for t in cleaned.split() if t]
+
+    def direction_for_destination(self, board, destination):
+        """
+        Given a complete 6-entry sign board and the building we're currently
+        heading to, return "LEFT" / "RIGHT" / "STRAIGHT", or None if this
+        board doesn't mention our destination.
+
+        Two resolution strategies, in order:
+          1. EXPLICIT - the token itself names a direction (e.g. "A_LEFT",
+             "A:STRAIGHT"). Preferred, since it doesn't rely on tile order.
+          2. POSITIONAL - fall back to SIGN_POSITION_TO_DIRECTION using the
+             token's index in the 6-entry set.
+        """
+        if destination is None:
+            return None
+        target_letter = self.building_to_sign.get(destination)
+        if target_letter is None:
+            return None
+
+        for idx, token in enumerate(board):
+            if target_letter not in token:
+                continue
+
+            # Strategy 1: explicit direction word embedded in the token.
+            for d in ("STRAIGHT", "LEFT", "RIGHT"):
+                if d in token:
+                    return d
+
+            # Strategy 2: positional fallback.
+            return SIGN_POSITION_TO_DIRECTION.get(idx)
+
+        return None  # our destination isn't on this board
+
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
@@ -503,10 +761,27 @@ class LineFollower(Node):
             return  # guard against a boot/glitch frame with no valid image_width
         half_width = width / 2.0
 
+        # If a sign-directed maneuver is running, check whether it's finished
+        # BEFORE dispatching, so the moment it completes we drive this frame
+        # in LANE_FOLLOW rather than one stale frame of the old mode.
+        self.check_maneuver_complete(message, width, half_width)
+
         if self.drive_mode == "LANE_FOLLOW":
             self._handle_lane_follow(message, width, half_width)
         elif self.drive_mode == "LINE_FOLLOW":
             self._handle_line_follow(message, width, half_width)
+        elif self.drive_mode == "STRAIGHT":
+            self._handle_straight(message, width, half_width)
+        else:
+            # SAFETY GUARD: without this, an unrecognized drive_mode would
+            # match no branch, nothing would write target_speed/target_turn,
+            # and publish_drive_commands would keep republishing the LAST
+            # command forever - i.e. if it happened mid-turn, the buggy
+            # would drive in a circle indefinitely.
+            self.get_logger().warn(
+                f"Unknown drive_mode '{self.drive_mode}' - reverting to LANE_FOLLOW.")
+            self.drive_mode = "LANE_FOLLOW"
+            self._handle_lane_follow(message, width, half_width)
 
     def lidar_callback(self, message):
         num_readings = len(message.ranges)
@@ -601,6 +876,10 @@ class LineFollower(Node):
             self.pending_letter = None
             self.pending_building = None
 
+            # Destination changed - any buffered sign data was read against
+            # the OLD destination, so it's meaningless now. Drop it.
+            self.sign_buffer = []
+
             self.get_logger().info(f"New destination received: {building} (letter '{target_letter}')")
             
             # Send ACK back to server (this will increment self.server_uid inside send_server_ack)
@@ -663,16 +942,63 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         """
-        Receives traffic sign boards.
+        Receives traffic sign boards and routes the buggy at intersections.
 
-        GUIDELINE (Sign Board Routing):
-        - Use the detected signs to choose the quickest route at intersections.
-        - Not wired up yet - once this parses real signs, it can set
-          self.drive_mode = "LINE_FOLLOW" and self.follow_side = "LEFT"/"RIGHT"
-          directly instead of the DEFAULT_* constants at the top of the file.
+        Flow:
+          1. Accumulate incoming entries into self.sign_buffer.
+          2. Do NOTHING until a COMPLETE set of SIGN_SET_SIZE (6) has arrived -
+             a partial read is unreliable and could route us the wrong way.
+          3. Look up self.current_destination on the completed board.
+          4. Switch drive_mode / follow_side to the required maneuver.
+          5. The maneuver auto-reverts to LANE_FOLLOW via
+             check_maneuver_complete() / check_maneuver_timeout().
         """
-        self.get_logger().info(f"Heard Sign Board: {message.data}")
-        pass
+        tokens = self.parse_sign_message(message.data)
+        if not tokens:
+            return
+
+        now = time.time()
+
+        # Expire a stale partial buffer, so leftover entries from a PREVIOUS
+        # intersection can never combine with new ones to form a bogus "set".
+        if self.sign_buffer and (now - self.sign_buffer_time) > SIGN_BUFFER_TIMEOUT:
+            self.get_logger().info("Stale partial sign buffer discarded.")
+            self.sign_buffer = []
+        self.sign_buffer_time = now
+
+        if len(tokens) >= SIGN_SET_SIZE:
+            # Whole board arrived in one message.
+            self.sign_buffer = tokens[:SIGN_SET_SIZE]
+        else:
+            # Entries trickling in one/few at a time - accumulate, preserving
+            # arrival order (position matters for the positional fallback).
+            for t in tokens:
+                if t not in self.sign_buffer:
+                    self.sign_buffer.append(t)
+
+        if len(self.sign_buffer) < SIGN_SET_SIZE:
+            self.get_logger().info(
+                f"Sign board incomplete ({len(self.sign_buffer)}/{SIGN_SET_SIZE}), waiting.")
+            return
+
+        board = self.sign_buffer[:SIGN_SET_SIZE]
+        self.get_logger().info(f"Complete sign board: {board}")
+        self.sign_buffer = []   # consumed - next intersection starts fresh
+
+        if self.maneuver_active:
+            self.get_logger().info("Maneuver already in progress, ignoring this board.")
+            return
+
+        direction = self.direction_for_destination(board, self.current_destination)
+
+        if direction is None:
+            self.get_logger().info(
+                f"Destination {self.current_destination} not found on this board - staying in LANE_FOLLOW.")
+            return
+
+        self.get_logger().info(
+            f"Board routes {self.current_destination} -> {direction}")
+        self.set_maneuver(direction)
 
 
 def main(args=None):
