@@ -84,6 +84,8 @@ LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on t
 LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
 LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
+STRAIGHT_SPEED = 0.4
+
 # Obstacle avoidance tuning
 OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this range
 FRONT_SECTOR_START_FRAC = 7 / 18     # start of the front sector, as a fraction of the full 360 scan
@@ -123,6 +125,19 @@ class LineFollower(Node):
             '/edge_vectors',
             self.edge_vectors_callback,
             QOS_PROFILE_DEFAULT)
+
+        self.publisher_drive_mode = self.create_publisher(
+            String,
+            '/drive_mode',
+            QOS_PROFILE_DEFAULT)
+
+        self.drive_mode = DEFAULT_DRIVE_MODE      # "LANE_FOLLOW" or "LINE_FOLLOW"
+        self.follow_side = DEFAULT_FOLLOW_SIDE    # "LEFT" or "RIGHT" (LINE_FOLLOW only)
+
+        # Publish current mode so vision node adjusts crop ROI automatically
+        mode_msg = String()
+        mode_msg.data = self.drive_mode  # e.g., "STRAIGHT" or "LANE_FOLLOW"
+        self.publisher_drive_mode.publish(mode_msg)
 
         # 2. LIDAR Obstacle Scanner
         self.subscription_lidar = self.create_subscription(
@@ -186,6 +201,10 @@ class LineFollower(Node):
         self.apex_active = False   # True if the line vanished WHILE it was in apex/horizontal orientation
         self.apex_turn = 0.0       # the turn command to sustain while apex_active
         self.apex_blind_frames = 0
+        self.straight_turn_direction = None  # Will hold "LEFT" or "RIGHT"
+        self.revert_lane_frames = 0
+        self.revert_armed = False  # Lock out reversion until intersection is entered
+        self.pending_intersection_direction = None
 
         # ===== SERVER COMMUNICATION STATE (added) =====
         self.sign_to_building = {
@@ -217,8 +236,7 @@ class LineFollower(Node):
         # DEFAULT_FOLLOW_SIDE if testing LINE_FOLLOW) at the top of this file
         # and restart the node. Later, sign_board_callback can set
         # self.drive_mode / self.follow_side directly instead.
-        self.drive_mode = DEFAULT_DRIVE_MODE      # "LANE_FOLLOW" or "LINE_FOLLOW"
-        self.follow_side = DEFAULT_FOLLOW_SIDE    # "LEFT" or "RIGHT" (LINE_FOLLOW only)
+        
 
         # LANE_FOLLOW bookkeeping
         self.lane_lost_frame_count = 0
@@ -283,7 +301,7 @@ class LineFollower(Node):
 
         if elapsed >= BLIND_APPROACH_DURATION:
             self.target_speed = 0.0
-            self.target_turn = 0.0
+            self.target_turn = 0.0  
             self.stopped_for_patient = True
             
             # Setup server retry state
@@ -482,33 +500,130 @@ class LineFollower(Node):
             self.target_turn = sign * LINE_TURN_HOLD
             self.target_speed = LINE_SPEED_BLIND
 
+
+    def _handle_straight(self, edge_vectors, width, half_width):
+        """
+        Lookahead steering controller for STRAIGHT mode.
+        Latches initial turn direction (LEFT/RIGHT) on 1 line and keeps turning 
+        until 2 lines are acquired (vector_count == 2).
+        """
+        mode_msg = String()
+        mode_msg.data = self.drive_mode
+        self.publisher_drive_mode.publish(mode_msg)
+
+        if edge_vectors.vector_count == 2:
+            # Both exit lines acquired! Unlock direction and center between them
+            self.straight_turn_direction = None
+
+            v1_mid_x = (edge_vectors.vector_1[0].x + edge_vectors.vector_1[1].x) / 2.0
+            v2_mid_x = (edge_vectors.vector_2[0].x + edge_vectors.vector_2[1].x) / 2.0
+            target_center_x = (v1_mid_x + v2_mid_x) / 2.0
+            error_x = target_center_x - half_width
+
+            KP_STRAIGHT = 0.004
+            self.target_turn = max(-1.0, min(1.0, KP_STRAIGHT * error_x))
+
+        elif edge_vectors.vector_count == 1:
+            # Lock in direction on the VERY FIRST frame we see the single line
+            if self.straight_turn_direction is None:
+                v1_mid_x = (edge_vectors.vector_1[0].x + edge_vectors.vector_1[1].x) / 2.0
+                if v1_mid_x < half_width:
+                    self.straight_turn_direction = "LEFT"
+                else:
+                    self.straight_turn_direction = "RIGHT"
+
+            # Hold the locked turn
+            if self.straight_turn_direction == "LEFT":
+                self.target_turn = 0.35   # Positive = Left in Cerebri
+            else:
+                self.target_turn = -0.35  # Negative = Right in Cerebri
+
+        else:
+            # vector_count == 0 (line temporarily out of frame during turn sweep)
+            if self.straight_turn_direction == "LEFT":
+                self.target_turn = 0.35   # Keep sweeping left until count == 2
+            elif self.straight_turn_direction == "RIGHT":
+                self.target_turn = -0.35  # Keep sweeping right until count == 2
+            else:
+                self.target_turn = 0.0    # Dead reckoning straight
+
+        self.target_speed = STRAIGHT_SPEED
+
+    def _check_revert_to_lane_follow(self, message, width):
+        """
+        Automatically reverts drive_mode back to LANE_FOLLOW only AFTER
+        the buggy has entered the intersection (vector_count < 2) and subsequently
+        re-acquires two valid parallel lane boundaries on exit.
+        """
+        if self.drive_mode in ["LINE_FOLLOW", "STRAIGHT"]:
+            # STEP 1: Arm the reversion logic only after double lanes disappear/open up
+            if not self.revert_armed:
+                if message.vector_count < 2:
+                    self.revert_armed = True
+                    self.get_logger().info("Entered intersection (vector_count < 2). Reversion logic ARMED.")
+                return  # Do not attempt to revert while still on the approach road
+
+            # STEP 2: Once armed, look for dual parallel lanes to signal turn completion
+            if message.vector_count == 2:
+                v1_mid_x = (message.vector_1[0].x + message.vector_1[1].x) / 2.0
+                v2_mid_x = (message.vector_2[0].x + message.vector_2[1].x) / 2.0
+                track_width = abs(v1_mid_x - v2_mid_x)
+
+                # Confirm track width is valid (not diverging cross-edges)
+                if track_width <= (width * TRACK_WIDTH_DIVERGENCE_RATIO):
+                    self.revert_lane_frames += 1
+                    if self.revert_lane_frames >= 30:  # require 3 consecutive stable frames
+                        self.drive_mode = "LANE_FOLLOW"
+                        self.revert_lane_frames = 0
+                        self.revert_armed = False
+
+                        mode_msg = String()
+                        mode_msg.data = self.drive_mode
+                        self.publisher_drive_mode.publish(mode_msg)
+
+                        self.get_logger().info("Reacquired double lane boundaries post-turn. Reverted drive_mode to LANE_FOLLOW.")
+            else:
+                self.revert_lane_frames = 0
+        
+
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
-        if self.obstacle_in_front:
-            # LIDAR has priority while dodging; don't fight the avoidance maneuver.
+        if self.obstacle_in_front or self.stopped_for_patient:
             return
 
-        if self.stopped_for_patient:
-            # We've deliberately stopped in the patient/hospital zone; don't
-            # let lane-following override that until we resume the mission.
-            return
-
-        """
-        Receives lane boundaries from the camera vector extractor and
-        dispatches to whichever mode is active (see drive_mode / follow_side).
-        """
         width = float(message.image_width)
         if width <= 0:
-            return  # guard against a boot/glitch frame with no valid image_width
+            return
         half_width = width / 2.0
 
+        # --- NEW: Check if we have reached an intersection while a direction is pending ---
+        if self.pending_intersection_direction and self.drive_mode == "LANE_FOLLOW":
+            # Entering intersection: double lanes break/open up (vector_count < 2)
+            if message.vector_count < 2:
+                self.get_logger().info(
+                    f"Entering intersection (vector_count={message.vector_count}). "
+                    f"Activating turn mode '{self.pending_intersection_direction}'."
+                )
+                self._switch_drive_mode(self.pending_intersection_direction)
+                self.pending_intersection_direction = None  # Clear buffered direction
+
+        # Check if we can switch back to LANE_FOLLOW post-turn
+        self._check_revert_to_lane_follow(message, width)
+
+        # Dispatch based on current mode
         if self.drive_mode == "LANE_FOLLOW":
             self._handle_lane_follow(message, width, half_width)
         elif self.drive_mode == "LINE_FOLLOW":
             self._handle_line_follow(message, width, half_width)
+        elif self.drive_mode == "STRAIGHT":
+            self._handle_straight(message, width, half_width)
+        
 
     def lidar_callback(self, message):
+        if self.stopped_for_patient:
+            return
+        
         num_readings = len(message.ranges)
         if num_readings == 0:
             return
@@ -663,16 +778,79 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         """
-        Receives traffic sign boards.
-
-        GUIDELINE (Sign Board Routing):
-        - Use the detected signs to choose the quickest route at intersections.
-        - Not wired up yet - once this parses real signs, it can set
-          self.drive_mode = "LINE_FOLLOW" and self.follow_side = "LEFT"/"RIGHT"
-          directly instead of the DEFAULT_* constants at the top of the file.
+        Parses traffic sign board detections using a dictionary lookup.
         """
-        self.get_logger().info(f"Heard Sign Board: {message.data}")
-        pass
+        if self.stopped_for_patient or self.obstacle_in_front:
+            return
+
+        raw_data = message.data.strip().upper()
+
+        # 1. Remove brackets/parentheses
+        cleaned = raw_data
+        for symbol in ["(", ")", "[", "]", "{", "}"]:
+            cleaned = cleaned.replace(symbol, "")
+
+        # 2. Split into entries (handles comma or space separation)
+        entries = cleaned.replace(',', ' ').split()
+
+        # 3. Build dictionary from Key:Value pairs (e.g., {'A': 'LEFT', 'B': 'STRAIGHT'})
+        sign_dict = {}
+        for entry in entries:
+            if ':' in entry:
+                key, val = entry.split(':', 1)
+                sign_dict[key.strip()] = val.strip()
+
+        target_building = self.current_destination  # e.g., 'PATIENT_1'
+        target_letter = self.building_to_sign.get(target_building, '')  # e.g., 'A'
+
+        # 4. Dictionary Lookup for target
+        chosen_direction = sign_dict.get(target_letter) or sign_dict.get(target_building)
+
+        # Fallback: handles space-separated lists like ['A', 'LEFT', 'B', 'STRAIGHT']
+        if not chosen_direction:
+            tokens = cleaned.replace(':', ' ').replace(',', ' ').split()
+            valid_directions = ["LEFT", "RIGHT", "STRAIGHT"]
+            for i in range(len(tokens) - 1):
+                if tokens[i] in [target_building, target_letter] and tokens[i + 1] in valid_directions:
+                    chosen_direction = tokens[i + 1]
+                    break
+
+        # Execute mode switch if direction was found
+        # Replace the mode execution block at the end of sign_board_callback with this:
+        if chosen_direction:
+            # Buffer the direction instead of switching immediately
+            self.pending_intersection_direction = chosen_direction
+            self.get_logger().info(
+                f"Sign Board parsed target '{target_building}' ({target_letter}) -> "
+                f"Buffered direction '{chosen_direction}' for upcoming intersection."
+            )
+        else:
+            self.get_logger().warn(
+                f"Sign board heard ({raw_data}), but no matching direction found for target '{target_building}'"
+            )
+
+    def _switch_drive_mode(self, direction):
+        """Switches drive_mode and publishes the change to the vision node."""
+        if direction in ["LEFT", "RIGHT"]:
+            self.drive_mode = "LINE_FOLLOW"
+            self.follow_side = direction
+        elif direction == "STRAIGHT":
+            self.drive_mode = "STRAIGHT"
+            self.straight_turn_direction = None
+
+        # Lock out reversion until we enter the intersection (vector_count < 2)
+        self.revert_lane_frames = 0
+        self.revert_armed = False
+
+        # Publish mode change to vision node
+        mode_msg = String()
+        mode_msg.data = self.drive_mode
+        self.publisher_drive_mode.publish(mode_msg)
+
+        self.get_logger().info(
+            f"Sign route selected direction '{direction}'. Switched drive_mode to '{self.drive_mode}' "
+            f"(follow_side='{self.follow_side if self.drive_mode == 'LINE_FOLLOW' else 'N/A'}'). Reversion locked out."
+        )
 
 
 def main(args=None):
