@@ -395,11 +395,11 @@ class LineFollower(Node):
 
                 if line_center_x >= half_width:
                     # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
-                    self.target_turn = (0.34+0.006*dx/dy)
+                    self.target_turn = (0.4+0.006*dx/dy)
                     self.target_speed = LANE_SHARP_SPEED     # ← dynamic, not hardcoded
                 else:
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
-                    self.target_turn = -(0.34+0.006*dx/dy)
+                    self.target_turn = -(0.4+0.006*dx/dy)
                     self.target_speed = LANE_SHARP_SPEED    # ← dynamic, not hardcoded
 
                 # Remember this as the committed apex turn - if the line
@@ -604,7 +604,7 @@ class LineFollower(Node):
                 # Confirm track width is valid (not diverging cross-edges)
                 if track_width <= (width * TRACK_WIDTH_DIVERGENCE_RATIO):
                     self.revert_lane_frames += 1
-                    if self.revert_lane_frames >= 60:  # require 3 consecutive stable frames
+                    if self.revert_lane_frames >= 30:  # require 3 consecutive stable frames
                         self.drive_mode = "LANE_FOLLOW"
                         self.revert_lane_frames = 0
                         self.revert_armed = False
@@ -881,6 +881,9 @@ class LineFollower(Node):
             if ':' in entry:
                 key, val = entry.split(':', 1)
                 sign_dict[key.strip()] = val.strip()
+
+        if len(sign_dict) < 6:
+            return
 
         target_building = self.current_destination  # e.g., 'PATIENT_1'
         target_letter = self.building_to_sign.get(target_building, '')  # e.g., 'A'
