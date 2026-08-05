@@ -72,19 +72,23 @@ TRACK_WIDTH_DIVERGENCE_RATIO = 1
 # LANE_FOLLOW speeds
 LANE_SPEED_TWO_LINES = 1.0    # confident: both boundaries agree on a normal-width track
 LANE_SPEED_ONE_LINE = 1.0     # only one boundary in play (either genuinely one visible, or divergence fallback)
-LANE_SPEED_LOST_SHORT = 0.30   # briefly no boundary at all: hold last turn, ease off speed
-LANE_SPEED_LOST_LONG = 0.15    # lost for a while: crawl instead of driving blind at speed
+LANE_SPEED_LOST_SHORT = 0.50   # briefly no boundary at all: hold last turn, ease off speed
+LANE_SPEED_LOST_LONG = 0.3    # lost for a while: crawl instead of driving blind at speed
 LANE_LOST_GRACE_FRAMES = 5     # frames before dropping from LOST_SHORT to LOST_LONG speed
 LANE_APEX_BLIND_GRACE_FRAMES = 10  # frames to keep sustaining the apex turn after the line vanishes mid-apex, before giving up and falling back to generic lost-line handling
+LANE_SHARP_SPEED = 0.4
 
 # LINE_FOLLOW speeds/behavior (single committed line, e.g. through an intersection)
-LINE_GAP_PX = 40.0             # if committed line's midpoint crosses within this many px of center, we're driving over it
 LINE_TURN_HOLD = 0.45          # steer magnitude to hold a turn arc toward the committed line
-LINE_TURN_EASE = 0.20          # reduced steer magnitude once we've drifted on top of the line
-LINE_SPEED_TRACK = 0.70        # speed while the committed line is visible and tracked
+LINE_SPEED_TRACK = 0.90        # speed while the committed line is visible and tracked
 LINE_SPEED_BLIND = 0.35        # speed while the committed line has vanished (e.g. turn apex) and we're sweeping to reacquire it
 
-STRAIGHT_SPEED = 0.4
+STRAIGHT_SPEED = 0.8
+
+# STRAIGHT mode (camera-based, green-signboard gate steering)
+STRAIGHT_STEER_KP = 0.004          # start same as lane STEER_KP, tune from debug image
+STRAIGHT_LOST_GRACE_FRAMES = 8     # frames with no board visible before easing off speed
+STRAIGHT_LOST_SPEED = 0.4          # speed once lost longer than the grace period
 
 # Obstacle avoidance tuning
 OBSTACLE_DISTANCE_THRESHOLD = 0.65    # meters; trigger avoidance below this range
@@ -93,6 +97,7 @@ FRONT_SECTOR_END_FRAC = 11 / 18      # end of the front sector, as a fraction of
 AVOID_TURN = 0.3
 AVOID_SPEED = 0.7
 
+
 # ===== QR APPROACH / STOP-IN-ZONE TIMING =====
 # The QR is mounted high on the building; as the buggy gets close, the
 # camera's fixed angle means the QR moves out of frame BEFORE the buggy has
@@ -100,7 +105,7 @@ AVOID_SPEED = 0.7
 # continuous QR visibility, we time how long to keep driving (normally,
 # via lane-following) after the LAST sighting before assuming we've arrived
 # and stopping. Tune this number against your real track distances.
-BLIND_APPROACH_DURATION = 4.2   # seconds to keep driving after QR was last seen
+BLIND_APPROACH_DURATION = 2.4   # seconds to keep driving after QR was last seen
 
 AVOID_RECOVERY_FRAMES = 6  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
@@ -125,6 +130,16 @@ class LineFollower(Node):
             '/edge_vectors',
             self.edge_vectors_callback,
             QOS_PROFILE_DEFAULT)
+
+        # 1b. Green signboard detections (STRAIGHT mode blind fallback only).
+        # Kept on a separate topic/callback from /edge_vectors on purpose -
+        # see notes in _handle_straight.
+        self.subscription_straight_vectors = self.create_subscription(
+            EdgeVectors,
+            '/straight_board_vectors',
+            self.straight_vectors_callback,
+            QOS_PROFILE_DEFAULT)
+        self.latest_straight_vectors = None  # most recent board detection msg
 
         self.publisher_drive_mode = self.create_publisher(
             String,
@@ -202,6 +217,8 @@ class LineFollower(Node):
         self.apex_turn = 0.0       # the turn command to sustain while apex_active
         self.apex_blind_frames = 0
         self.straight_turn_direction = None  # Will hold "LEFT" or "RIGHT"
+        self.straight_lost_frames = 0        # consecutive frames with no green board seen
+        self.straight_board_seen = False     # has a board been acquired yet this STRAIGHT session
         self.revert_lane_frames = 0
         self.revert_armed = False  # Lock out reversion until intersection is entered
         self.pending_intersection_direction = None
@@ -376,12 +393,12 @@ class LineFollower(Node):
 
                 if line_center_x >= half_width:
                     # PHASE 2: Hit the Apex! (Hard Left Turn once track opens up)
-                    self.target_turn = (0.33+0.006*dx/dy)
-                    self.target_speed = apex_speed     # ← dynamic, not hardcoded
+                    self.target_turn = (0.34+0.006*dx/dy)
+                    self.target_speed = LANE_SHARP_SPEED     # ← dynamic, not hardcoded
                 else:
                     # PHASE 2: Hit the Apex! (Hard Right Turn)
-                    self.target_turn = -(0.33+0.006*dx/dy)
-                    self.target_speed = apex_speed     # ← dynamic, not hardcoded
+                    self.target_turn = -(0.34+0.006*dx/dy)
+                    self.target_speed = LANE_SHARP_SPEED    # ← dynamic, not hardcoded
 
                 # Remember this as the committed apex turn - if the line
                 # vanishes entirely on the very next frame (very common right
@@ -501,52 +518,65 @@ class LineFollower(Node):
             self.target_speed = LINE_SPEED_BLIND
 
 
-    def _handle_straight(self, edge_vectors, width, half_width):
+    def straight_vectors_callback(self, message):
         """
-        Lookahead steering controller for STRAIGHT mode.
-        Latches initial turn direction (LEFT/RIGHT) on 1 line and keeps turning 
-        until 2 lines are acquired (vector_count == 2).
+        Stores the latest green-signboard detection (published only during
+        STRAIGHT mode by edge_vectors_publisher). Kept on its own topic and
+        callback deliberately - NOT merged into /edge_vectors - because
+        _check_revert_to_lane_follow reads /edge_vectors as real lane-line
+        midpoints to decide when to hand control back to LANE_FOLLOW. Mixing
+        board detections into that stream previously caused it to revert off
+        coincidental board geometry instead of genuinely reacquired lines.
         """
-        mode_msg = String()
-        mode_msg.data = self.drive_mode
-        self.publisher_drive_mode.publish(mode_msg)
+        self.latest_straight_vectors = message
 
-        if edge_vectors.vector_count == 2:
-            # Both exit lines acquired! Unlock direction and center between them
-            self.straight_turn_direction = None
+    def _handle_straight(self, message, width, half_width):
+        """
+        STRAIGHT mode: primarily just lane-follows off the painted lines like
+        normal (a straight corridor usually still has visible lane lines,
+        same as everywhere else on the track) via _handle_lane_follow. Only
+        when we're fully blind to lines - message.vector_count == 0 on the
+        normal lane-line /edge_vectors stream, e.g. the open gap right at the
+        intersection where there's no paint - do we fall back to steering off
+        the green signboards published separately on /straight_board_vectors.
 
-            v1_mid_x = (edge_vectors.vector_1[0].x + edge_vectors.vector_1[1].x) / 2.0
-            v2_mid_x = (edge_vectors.vector_2[0].x + edge_vectors.vector_2[1].x) / 2.0
-            target_center_x = (v1_mid_x + v2_mid_x) / 2.0
-            error_x = target_center_x - half_width
+        `message` here is the normal lane-line EdgeVectors message (same one
+        LANE_FOLLOW/LINE_FOLLOW use), NOT the board detection message.
+        """
+        if message.vector_count > 0:
+            # Lines visible - simple lane-follow centering, same as LANE_FOLLOW.
+            self.straight_lost_frames = 0
+            self._handle_lane_follow(message, width, half_width)
+            return
 
-            KP_STRAIGHT = 0.004
-            self.target_turn = max(-1.0, min(1.0, KP_STRAIGHT * error_x))
+        # Blind to lines - fall back to the most recent green-board detection.
+        board_msg = self.latest_straight_vectors
 
-        elif edge_vectors.vector_count == 1:
-            # Lock in direction on the VERY FIRST frame we see the single line
-            if self.straight_turn_direction is None:
-                v1_mid_x = (edge_vectors.vector_1[0].x + edge_vectors.vector_1[1].x) / 2.0
-                if v1_mid_x < half_width:
-                    self.straight_turn_direction = "LEFT"
-                else:
-                    self.straight_turn_direction = "RIGHT"
+        if board_msg is None or board_msg.vector_count == 0:
+            self.straight_lost_frames += 1
 
-            # Hold the locked turn
-            if self.straight_turn_direction == "LEFT":
-                self.target_turn = 0.35   # Positive = Left in Cerebri
+            if not self.straight_board_seen:
+                # Never acquired a board yet this session - don't trust
+                # whatever target_turn happens to be sitting from before the
+                # mode switch (or from lane-follow a moment ago). Go
+                # dead-straight until we actually see something to steer on.
+                self.target_turn = 0.0
+                self.target_speed = STRAIGHT_SPEED
             else:
-                self.target_turn = -0.35  # Negative = Right in Cerebri
+                # Previously tracking a board, briefly lost it - hold the
+                # last commanded turn, easing off speed the longer it persists.
+                self.target_speed = (STRAIGHT_SPEED
+                                      if self.straight_lost_frames < STRAIGHT_LOST_GRACE_FRAMES
+                                      else STRAIGHT_LOST_SPEED)
+            return
 
-        else:
-            # vector_count == 0 (line temporarily out of frame during turn sweep)
-            if self.straight_turn_direction == "LEFT":
-                self.target_turn = 0.35   # Keep sweeping left until count == 2
-            elif self.straight_turn_direction == "RIGHT":
-                self.target_turn = -0.35  # Keep sweeping right until count == 2
-            else:
-                self.target_turn = 0.0    # Dead reckoning straight
+        self.straight_lost_frames = 0
+        self.straight_board_seen = True
 
+        p0, p1 = board_msg.vector_1[0], board_msg.vector_1[1]
+        board_mid_x = (p0.x + p1.x) / 2.0
+        error = half_width - board_mid_x
+        self.target_turn = max(-1.0, min(1.0, STRAIGHT_STEER_KP * error))
         self.target_speed = STRAIGHT_SPEED
 
     def _check_revert_to_lane_follow(self, message, width):
@@ -572,7 +602,7 @@ class LineFollower(Node):
                 # Confirm track width is valid (not diverging cross-edges)
                 if track_width <= (width * TRACK_WIDTH_DIVERGENCE_RATIO):
                     self.revert_lane_frames += 1
-                    if self.revert_lane_frames >= 30:  # require 3 consecutive stable frames
+                    if self.revert_lane_frames >= 60:  # require 3 consecutive stable frames
                         self.drive_mode = "LANE_FOLLOW"
                         self.revert_lane_frames = 0
                         self.revert_armed = False
@@ -597,13 +627,23 @@ class LineFollower(Node):
             return
         half_width = width / 2.0
 
-        # --- NEW: Check if we have reached an intersection while a direction is pending ---
+        # --- Check if we have reached an intersection while a direction is pending ---
         if self.pending_intersection_direction and self.drive_mode == "LANE_FOLLOW":
-            # Entering intersection: double lanes break/open up (vector_count < 2)
-            if message.vector_count < 2:
+            should_switch = False
+
+            if self.pending_intersection_direction == "STRAIGHT":
+                # Wait until lines clear out completely (vector_count == 0)
+                if message.vector_count == 0:
+                    should_switch = True
+            else:
+                # LINE_FOLLOW (LEFT/RIGHT): switch as soon as double lines break (vector_count < 2)
+                if message.vector_count < 2:
+                    should_switch = True
+
+            if should_switch:
                 self.get_logger().info(
                     f"Entering intersection (vector_count={message.vector_count}). "
-                    f"Activating turn mode '{self.pending_intersection_direction}'."
+                    f"Activating mode '{self.pending_intersection_direction}'."
                 )
                 self._switch_drive_mode(self.pending_intersection_direction)
                 self.pending_intersection_direction = None  # Clear buffered direction
@@ -623,7 +663,8 @@ class LineFollower(Node):
     def lidar_callback(self, message):
         if self.stopped_for_patient:
             return
-        
+
+
         num_readings = len(message.ranges)
         if num_readings == 0:
             return
@@ -837,6 +878,9 @@ class LineFollower(Node):
         elif direction == "STRAIGHT":
             self.drive_mode = "STRAIGHT"
             self.straight_turn_direction = None
+            self.straight_board_seen = False   # fresh session - no stale-turn hold
+            self.straight_lost_frames = 0
+            self.target_turn = 0.0             # clear any residual turn from LANE_FOLLOW
 
         # Lock out reversion until we enter the intersection (vector_count < 2)
         self.revert_lane_frames = 0

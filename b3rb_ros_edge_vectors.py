@@ -34,6 +34,23 @@ GREEN_COLOR = (0, 255, 0)
 VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.4
 VECTOR_MAGNITUDE_MINIMUM = 2.25
 
+CROP_LEFT_RATIO = 0.15
+CROP_RIGHT_RATIO = 0.85
+
+# ------------------ STRAIGHT mode: green signboard detection ------------------
+# Signboards marking the straight-through gate show green on the back side.
+# We detect them by color instead of the black-lane-edge threshold used
+# elsewhere - color gives semantic identification (this IS a board) that
+# LiDAR clustering can't provide, since LiDAR can't tell a pole apart from
+# a wall corner or curb.
+GREEN_HSV_LOWER = np.array([35, 60, 40])    # tune against real sim/board footage
+GREEN_HSV_UPPER = np.array([85, 255, 255])
+MIN_BOARD_AREA_PX = 40      # ignore tiny green speckle noise
+BOARD_MIN_ASPECT = 0.2      # width/height bounding-box ratio filter
+BOARD_MAX_ASPECT = 5.0      # widened from 3.0 - real board measured at aspect=3.91
+GREEN_ROI_TOP_RATIO = 0.15      # skip sky/horizon clutter above this
+GREEN_ROI_BOTTOM_RATIO = 0.90   # skip the buggy's own chassis below this
+
 class EdgeVectorsPublisher(Node):
     """
     ROS 2 Node that processes raw camera images to detect the lane edges (left/right bounds).
@@ -57,10 +74,22 @@ class EdgeVectorsPublisher(Node):
 
         self.current_drive_mode = "LANE_FOLLOW"
 
-        # Publisher for edge vectors.
+        # Publisher for edge vectors (black lane-line boundaries - always
+        # published, regardless of drive_mode, unchanged from original).
         self.publisher_edge_vectors = self.create_publisher(
             EdgeVectors,
             '/edge_vectors',
+            QOS_PROFILE_DEFAULT)
+
+        # Publisher for green signboard detections (STRAIGHT mode only).
+        # Separate topic from /edge_vectors on purpose: line_follower's
+        # LANE_FOLLOW-reversion logic reads /edge_vectors as real lane-line
+        # midpoints, and mixing board data into that stream caused it to
+        # revert modes off coincidental board geometry instead of actual
+        # reacquired lane lines.
+        self.publisher_straight_vectors = self.create_publisher(
+            EdgeVectors,
+            '/straight_board_vectors',
             QOS_PROFILE_DEFAULT)
 
         # Publisher for thresh image (for debugging thresholding/segmentation).
@@ -73,6 +102,19 @@ class EdgeVectorsPublisher(Node):
         self.publisher_vector_image = self.create_publisher(
             CompressedImage,
             "/debug_images/vector_image",
+            QOS_PROFILE_DEFAULT)
+
+        # Dedicated debug image topics for green-board detection, separate
+        # from the lane-line debug topics above so the two don't clobber each
+        # other when both run in the same frame during STRAIGHT mode.
+        self.publisher_straight_thresh_image = self.create_publisher(
+            CompressedImage,
+            "/debug_images/straight_thresh_image",
+            QOS_PROFILE_DEFAULT)
+
+        self.publisher_straight_vector_image = self.create_publisher(
+            CompressedImage,
+            "/debug_images/straight_vector_image",
             QOS_PROFILE_DEFAULT)
 
         self.image_height = 0
@@ -148,7 +190,87 @@ class EdgeVectorsPublisher(Node):
 
         return vectors, image
 
-    def process_image_for_edge_vectors(self, image, lookahead=False):
+    def detect_green_boards(self, image):
+        """
+        Detects green signboard rectangles (back of the intersection
+        signboards) for STRAIGHT-mode gate steering.
+
+        Returns up to 2 candidate vectors, each
+        [top_left_xy, bottom_right_xy, centrality], sorted by centrality
+        (smallest = closest to image horizontal center first). vector_1
+        downstream will always be the most-centered board.
+        """
+        roi_top = int(self.image_height * GREEN_ROI_TOP_RATIO)
+        roi_bottom = int(self.image_height * GREEN_ROI_BOTTOM_RATIO)
+        roi = image[roi_top:roi_bottom, :]
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, GREEN_HSV_LOWER, GREEN_HSV_UPPER)
+
+        # Clean up speckle noise / fill small gaps in the board's mask.
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+
+        image_center_x = self.image_width / 2.0
+        candidates = []
+        debug_img = roi.copy()
+
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            if w == 0 or h == 0:
+                continue
+
+            # Use actual pixel count inside the bounding box, NOT
+            # cv2.contourArea(). contourArea computes polygon area, which
+            # badly undercounts thin/elongated blobs (a board seen at a
+            # shallow angle, partially occluded, or just naturally
+            # thin-looking from this distance) - a shape can be full of green
+            # pixels yet still read as near-zero contourArea, silently
+            # failing the area filter even though the mask clearly shows it.
+            pixel_count = cv2.countNonZero(mask[y:y + h, x:x + w])
+            aspect = w / float(h)
+
+            # TEMP DEBUG: log raw stats for every contour, pass or fail, so
+            # you can read off real numbers and set MIN_BOARD_AREA_PX /
+            # BOARD_MIN_ASPECT / BOARD_MAX_ASPECT from actual data instead of
+            # guessing. Remove this once the constants are tuned.
+            self.get_logger().info(
+                f"STRAIGHT contour: w={w} h={h} aspect={aspect:.2f} "
+                f"pixel_count={pixel_count}"
+            )
+
+            if pixel_count < MIN_BOARD_AREA_PX:
+                continue
+            if not (BOARD_MIN_ASPECT <= aspect <= BOARD_MAX_ASPECT):
+                continue
+
+            # Transform back into full-image coordinates.
+            top_left = [x, y + roi_top]
+            bottom_right = [x + w, y + h + roi_top]
+            center_x = (top_left[0] + bottom_right[0]) / 2.0
+            centrality = abs(center_x - image_center_x)
+
+            candidates.append([top_left, bottom_right, centrality])
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), GREEN_COLOR, 2)
+
+        if not candidates and len(contours) > 0:
+            self.get_logger().warn(
+                f"STRAIGHT: {len(contours)} green contour(s) found but all "
+                f"filtered out - check MIN_BOARD_AREA_PX / BOARD_MIN_ASPECT / "
+                f"BOARD_MAX_ASPECT against real board size in the debug image."
+            )
+
+        candidates.sort(key=lambda v: v[2])
+
+        self.publish_debug_image(self.publisher_straight_vector_image, debug_img)
+        self.publish_debug_image(self.publisher_straight_thresh_image, mask)
+
+        return candidates[:2]
+
+    def process_image_for_edge_vectors(self, image):
         """
         Applies basic preprocessing (Grayscale + Thresholding) and extracts lane vectors.
         
@@ -170,27 +292,18 @@ class EdgeVectorsPublisher(Node):
 
         # 2. Binary Thresholding (aiming to isolate the black stripes of the track)
         # Note: In the simulation, black stripes will result in low intensity values (close to 0).
+        # Horizontal crop range (Left / Right boundaries)
+        crop_left = int(self.image_width * CROP_LEFT_RATIO)
+        crop_right = int(self.image_width * CROP_RIGHT_RATIO)
+
         threshold_black = 25
         thresh = cv2.threshold(gray, threshold_black, 255, cv2.THRESH_BINARY_INV)[1]
+        # Standard mode (Exact reference cropping)
+        self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
+        self.upper_image_height = int(self.image_height - self.lower_image_height)
 
-        # 3. Crop based on lookahead mode
-        if lookahead:
-            # Upper/middle slice for distant lookahead during STRAIGHT mode
-            crop_top = int(self.image_height * 0.40)
-            crop_bottom = int(self.image_height * 0.70)
-            
-            self.upper_image_height = crop_top
-            self.lower_image_height = crop_bottom - crop_top
-
-            thresh_cropped = thresh[crop_top:crop_bottom]
-            image_cropped = image[crop_top:crop_bottom].copy()
-        else:
-            # Standard mode (Exact reference cropping)
-            self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
-            self.upper_image_height = int(self.image_height - self.lower_image_height)
-
-            thresh_cropped = thresh[self.image_height - self.lower_image_height:]
-            image_cropped = image[self.image_height - self.lower_image_height:].copy()
+        thresh_cropped = thresh[self.image_height - self.lower_image_height:]
+        image_cropped = image[self.image_height - self.lower_image_height:].copy()
 
         # 4. Compute vectors from the binary image contours
         vectors, debug_img = self.compute_vectors_from_image(image_cropped, thresh_cropped)
@@ -227,18 +340,17 @@ class EdgeVectorsPublisher(Node):
         # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        self.image_height, self.image_width, _ = image.shape
 
-        # Use lookahead mode if drive_mode is STRAIGHT
-        is_straight = (self.current_drive_mode == "STRAIGHT")
-        vectors = self.process_image_for_edge_vectors(image, lookahead=is_straight)
+        # Lane-line black-edge detection always runs, unchanged, regardless
+        # of drive_mode - this is the original behavior, restored.
+        vectors = self.process_image_for_edge_vectors(image)
 
-        # Construct and publish the ROS 2 EdgeVectors message
         vectors_message = EdgeVectors()
         vectors_message.image_height = image.shape[0]
         vectors_message.image_width = image.shape[1]
         vectors_message.vector_count = 0
 
-        # Vector 1 (usually representing Left boundary)
         if len(vectors) > 0:
             vectors_message.vector_1[0].x = float(vectors[0][0][0])
             vectors_message.vector_1[0].y = float(vectors[0][0][1])
@@ -246,7 +358,6 @@ class EdgeVectorsPublisher(Node):
             vectors_message.vector_1[1].y = float(vectors[0][1][1])
             vectors_message.vector_count += 1
 
-        # Vector 2 (usually representing Right boundary)
         if len(vectors) > 1:
             vectors_message.vector_2[0].x = float(vectors[1][0][0])
             vectors_message.vector_2[0].y = float(vectors[1][0][1])
@@ -255,6 +366,33 @@ class EdgeVectorsPublisher(Node):
             vectors_message.vector_count += 1
 
         self.publisher_edge_vectors.publish(vectors_message)
+
+        # Green signboard detection only runs during STRAIGHT, published on
+        # its own separate topic so it never gets mistaken for lane-line data
+        # downstream.
+        if self.current_drive_mode == "STRAIGHT":
+            board_vectors = self.detect_green_boards(image)
+
+            straight_message = EdgeVectors()
+            straight_message.image_height = image.shape[0]
+            straight_message.image_width = image.shape[1]
+            straight_message.vector_count = 0
+
+            if len(board_vectors) > 0:
+                straight_message.vector_1[0].x = float(board_vectors[0][0][0])
+                straight_message.vector_1[0].y = float(board_vectors[0][0][1])
+                straight_message.vector_1[1].x = float(board_vectors[0][1][0])
+                straight_message.vector_1[1].y = float(board_vectors[0][1][1])
+                straight_message.vector_count += 1
+
+            if len(board_vectors) > 1:
+                straight_message.vector_2[0].x = float(board_vectors[1][0][0])
+                straight_message.vector_2[0].y = float(board_vectors[1][0][1])
+                straight_message.vector_2[1].x = float(board_vectors[1][1][0])
+                straight_message.vector_2[1].y = float(board_vectors[1][1][1])
+                straight_message.vector_count += 1
+
+            self.publisher_straight_vectors.publish(straight_message)
 
 def main(args=None):
     rclpy.init(args=args)
