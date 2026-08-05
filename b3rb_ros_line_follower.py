@@ -234,6 +234,8 @@ class LineFollower(Node):
         self.awaiting_hospital = False
         
         self.current_destination = 'PATIENT_1' # Start by looking for Patient 1
+        self.previous_destination = 'PATIENT_1'  # Tracks previous node for rollback
+        self.patients_delivered = 0             # Delivery counter
         self.waiting_for_ack = False
         self.server_retries = 0
         self.last_msg_send_time = 0.0
@@ -744,23 +746,62 @@ class LineFollower(Node):
                 self.server_uid = (self.server_uid + 1) % 256
             return
 
-        # 2. Handle incoming target command from server (e.g., 'X', 'Y', 'Z')
-        target_letter = message.msg.strip()
-        building = self.sign_to_building.get(target_letter)
-        if building is not None:
-            self.current_destination = building
-            self.awaiting_hospital = False
+        # 2. Handle incoming server command / response
+        raw_msg = message.msg.strip().upper()
 
-            # Resume driving
+        # Mission Complete Response
+        if raw_msg == "OK":
+            self.patients_delivered += 1
+            self.mission_completed = True
+            self.target_speed = 0.0
+            self.target_turn = 0.0
+            self.stopped_for_patient = True
+            
+            self.get_logger().info(
+                f"Received 'OK' from server! Mission Completed. "
+                f"Total Patients Delivered: {self.patients_delivered}/3. Buggy stopped."
+            )
+            self.send_server_ack(message.uid)
+
+        # Invalid Dropoff / Target Response -> Revert & Resume
+        elif raw_msg == "INVALID":
+            self.get_logger().warn(
+                f"Server returned 'INVALID'. Reverting destination from '{self.current_destination}' "
+                f"to '{self.previous_destination}' and resuming movement."
+            )
+            # Roll back destination and resume drive
+            self.current_destination = self.previous_destination
             self.stopped_for_patient = False
             self.qr_approach_active = False
             self.pending_letter = None
             self.pending_building = None
-
-            self.get_logger().info(f"New destination received: {building} (letter '{target_letter}')")
             
-            # Send ACK back to server (this will increment self.server_uid inside send_server_ack)
             self.send_server_ack(message.uid)
+
+        # New Destination Command (e.g., 'A', 'B', 'C', 'X', 'Y', 'Z')
+        else:
+            building = self.sign_to_building.get(raw_msg)
+            if building is not None:
+                # Store history before updating
+                self.previous_destination = self.current_destination
+                self.current_destination = building
+                self.awaiting_hospital = False
+
+                # Increment delivery count when returning from Hospital to Patient
+                if "PATIENT" in building and "HOSPITAL" in self.previous_destination:
+                    self.patients_delivered += 1
+                    self.get_logger().info(f"Patient delivery confirmed! Count: {self.patients_delivered}/3")
+
+                # Resume driving toward new target
+                self.stopped_for_patient = False
+                self.qr_approach_active = False
+                self.pending_letter = None
+                self.pending_building = None
+
+                self.get_logger().info(f"New destination received: {building} (letter '{raw_msg}')")
+                
+                # Send ACK back to server
+                self.send_server_ack(message.uid)
 
     def send_server_update(self, text_msg, uid):
         """Sends a data message to the server with a specific UID."""
