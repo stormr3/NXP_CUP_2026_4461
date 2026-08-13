@@ -698,7 +698,7 @@ class LineFollower(Node):
             self.target_turn = turn
             self.target_speed = AVOID_SPEED
         
-        elif self.recovery_frames_remaining > 0 and self.frames_avoided > 5:
+        elif self.recovery_frames_remaining > 0 and self.frames_avoided > 30:
             self.get_logger().info(f"Frames avoided ={self.frames_avoided}")
             # Recovery: check if return path is clear first
             mid = len(front_sector) // 2
