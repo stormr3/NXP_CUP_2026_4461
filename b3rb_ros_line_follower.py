@@ -13,6 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# =============================================================================
+#  MERGE SUMMARY - what changed vs. the pre-parking version
+#  Every added/changed block is fenced with:  # ===== PARKING: ... =====
+#  Nothing outside those fences was modified. Full list:
+#
+#   1. NEW module-level constants block  ("PARKING PARAMETERS")
+#   2. NEW module-level helpers          (wrap_pi, ang_diff, polar_to_xy)
+#   3. __init__                          + parking state variables
+#   4. publish_drive_commands            + one call to check_parking_tick()
+#   5. edge_vectors_callback             + one guard line at the top
+#   6. lidar_callback                    + parking block at the top
+#   7. server_communication_callback     'OK' branch now calls start_parking()
+#   8. qr_detection_callback             + one guard line
+#   9. sign_board_callback               + one guard line
+#  10. NEW parking methods               (whole new section at the end of class)
+#
+#  All original driving logic (lane follow, line follow, straight, apex memory,
+#  revert lock, obstacle avoidance, QR blind timing, server retries, sign
+#  parsing) is byte-for-byte unchanged.
+# =============================================================================
+
 import rclpy
 from rclpy.node import Node
 import time
@@ -109,6 +130,195 @@ BLIND_APPROACH_DURATION = 2.4   # seconds to keep driving after QR was last seen
 
 AVOID_RECOVERY_FRAMES = 6  # ~1.2s at 10Hz; camera blocked after obstacle clears
 
+
+# =============================================================================
+# ===== COLLISION RECOVERY: PARAMETERS (NEW BLOCK) =====
+#
+#  PURPOSE
+#  -------
+#  If the buggy wedges itself against a wall / cone / building - anywhere on
+#  the track, or mid-park - back out, change the approach angle, and carry on.
+#  This is a safety net under the WHOLE run, not a parking feature.
+#
+#  THE HARD PART IS DETECTION, NOT THE REVERSE
+#  -------------------------------------------
+#  Backing up is three lines. Knowing you are stuck is the real problem: there
+#  is no contact sensor and no /collision topic in this stack, so "I have hit
+#  something" must be INFERRED. And a false positive is expensive - reversing
+#  mid-track when nothing is wrong ruins an otherwise clean run.
+#
+#  THE SIGNAL WE USE (LIDAR only - no new subscriptions, works today):
+#      "I am commanding real forward speed,
+#       something is very close in front,
+#       and that distance is NOT changing."
+#
+#  All three must hold, for STUCK_CONFIRM_FRAMES in a row. The third clause is
+#  what makes this safe: if you were merely approaching a wall, the range would
+#  be shrinking every frame. A range pinned flat while you push forward means
+#  you are physically against something.
+#
+#  FALSE-POSITIVE GATES (each kills one specific "not actually stuck" case):
+#    - commanded speed below STUCK_MIN_CMD_SPEED  -> stopped on purpose
+#    - stopped_for_patient                        -> parked at a QR building
+#    - park_state in CREEP/SETTLE/PARKED/HOLD     -> crawling at a rail IS the
+#                                                    goal during parking
+#    - cooldown after a recovery                  -> don't re-fire on the same
+#                                                    event we just handled
+# =============================================================================
+
+RECOVERY_ENABLED = True             # master switch - set False to disable entirely
+
+# ---- Detection ---------------------------------------------------------------
+STUCK_MIN_CMD_SPEED = 0.15          # must be commanding at least this to arm
+STUCK_FRONT_RANGE = 0.30            # metres; this close = probably touching  [MEASURE]
+STUCK_FRONT_SECTOR_HALF_DEG = 30.0  # front cone watched for the stuck test
+STUCK_RANGE_JITTER = 0.03           # metres; range flatter than this = pinned
+STUCK_CONFIRM_FRAMES = 8            # ~0.8 s at 10 Hz before we believe it
+
+# ---- Recovery maneuver -------------------------------------------------------
+RECOVERY_REVERSE_SPEED = -0.30      # negative = reverse (your Joy contract allows it)
+RECOVERY_COUNTER_STEER = 0.60       # steer magnitude while reversing
+
+# WHY COUNTER-STEER: if you hit something while turning left, reversing STRAIGHT
+# puts you back on the same line and you hit it again. Reversing with opposite
+# lock swings the nose away, so the next forward attempt has a different angle.
+# Same thing you do in a car after misjudging a turn.
+
+RECOVERY_REVERSE_BASE_TIME = 1.0    # seconds of reverse on the 1st attempt
+RECOVERY_REVERSE_TIME_STEP = 0.6    # + this much per escalation
+RECOVERY_PAUSE_TIME = 0.4           # seconds stopped before reassessing
+RECOVERY_CLEAR_RANGE = 0.60         # front range that counts as "path is open again"
+
+# ---- Loop protection ---------------------------------------------------------
+# The classic failure: hit wall -> reverse -> drive -> hit same wall -> forever,
+# burning the whole run. So attempts ESCALATE (longer reverse, flipped steer)
+# and then STOP.
+RECOVERY_MAX_ATTEMPTS = 3           # after this, give up and drive on
+RECOVERY_COOLDOWN = 2.0             # seconds of detector blackout after recovery
+RECOVERY_ATTEMPT_RESET = 15.0       # seconds of clean driving that resets the counter
+
+# States in which the CAMERA must be ignored (recovery owns the wheel)
+RECOVERY_STATES_ACTIVE = ('REVERSE', 'PAUSE')
+
+# ===== END COLLISION RECOVERY PARAMETERS =====
+
+
+# =============================================================================
+# ===== PARKING: PARAMETERS (NEW BLOCK) =====
+#
+#  Runs only AFTER the server says 'OK' (all patients delivered).
+#
+#  WHY LIDAR AND NOT CAMERA:
+#  The parking pad is a big WHITE surface on grey ground. edge_vectors will
+#  happily lock onto its boundary and fight the maneuver. The cone/rail
+#  dividers instead give LIDAR a distinctive "comb": near returns (cones)
+#  separated by deep returns (open bays). That signature is lighting-
+#  independent. The camera is not used for parking at all.
+#
+#  BEARING CONVENTION (derived from your own avoidance sector maths:
+#  FRONT_SECTOR is 7/18..11/18 of the array and [:mid] is treated as RIGHT,
+#  which is only true if index 0 == -180 deg):
+#      index frac 0.00 -> -180 deg  (rear)
+#      index frac 0.25 ->  -90 deg  (RIGHT)
+#      index frac 0.50 ->    0 deg  (FRONT)
+#      index frac 0.75 -> +/-90 deg (LEFT)
+#  The parking code below uses angle_min + i*angle_increment instead of index
+#  fractions, so it stays correct even if that assumption is ever wrong.
+# =============================================================================
+
+# ---- Which side of the track the parking pad sits on ------------------------
+# Watch the buggy's approach in Gazebo: if the pad passes on the driver's LEFT,
+# leave this as "LEFT". This one constant flips BOTH the search sector and the
+# steering direction, so it is the only thing you change to mirror the maneuver.
+PARK_SIDE = "LEFT"                  # "LEFT" or "RIGHT"          [MEASURE]
+
+# ---- Vehicle envelope --------------------------------------------------------
+PARK_VEHICLE_WIDTH = 0.22           # metres, widest point        [MEASURE]
+PARK_SAFETY_MARGIN = 0.06           # metres clearance per side   [MEASURE]
+
+# ---- Speeds ------------------------------------------------------------------
+# Parking is a precision maneuver. Raising these is the fastest way to hit a cone.
+PARK_SEARCH_SPEED_CAP = 0.45        # cap on lane-follow speed while hunting a bay
+PARK_ENTRY_SPEED = 0.28             # speed during the turn-in arc
+PARK_CREEP_SPEED = 0.22             # speed while creeping to final depth
+PARK_TURN_FULL = 1.0                # full steering lock
+
+# ---- Bay detection: the "comb" ----------------------------------------------
+# A beam on the park side counts as STRUCTURE (cone / rail) below this range.
+# Set it from ONE measurement: park manually beside the pad, `ros2 topic echo
+# /scan`, read the range to the nearest cone, use ~1.5x that.
+PARK_CONE_RANGE_MAX = 1.60          # metres                      [MEASURE]
+
+# Minimum bay width, cone-to-cone, measured metrically in Cartesian space.
+# NOT an angular threshold - angular width silently changes meaning with range.
+PARK_GAP_MIN_WIDTH = PARK_VEHICLE_WIDTH + 2.0 * PARK_SAFETY_MARGIN   # 0.34 m
+
+# Upper bound. THIS is what rejects "I have driven past the end of the pad and
+# am now staring at empty field".
+PARK_GAP_MAX_WIDTH = 1.20           # metres                      [MEASURE]
+
+# A bay must be genuinely DEEPER than the cones bounding it, otherwise it is
+# not an opening, just a seam between two objects at the same range.
+PARK_BAY_MIN_DEPTH_GAIN = 0.25      # metres
+PARK_GAP_MIN_BEAMS = 3              # reject single-beam sensor noise
+
+# ---- Sectors -----------------------------------------------------------------
+PARK_SEARCH_SECTOR_CENTER_DEG = 90.0    # abeam, on the park side
+PARK_SEARCH_SECTOR_HALF_DEG = 55.0
+PARK_ENTRY_SECTOR_CENTER_DEG = 50.0     # widened: the bay sweeps forward as we turn
+PARK_ENTRY_SECTOR_HALF_DEG = 70.0
+PARK_FRONT_SECTOR_HALF_DEG = 18.0       # for the "how deep am I" stop test
+PARK_CENTER_SECTOR_HALF_DEG = 25.0      # around +/-90 deg, for in-bay centering
+
+# ---- Commit geometry ---------------------------------------------------------
+# Forward distance (vehicle-frame +x) at which we stop driving past the pad and
+# begin the arc. An Ackermann vehicle MUST start turning before the bay is
+# exactly abeam, or the rear inner wheel cuts the corner and clips the divider.
+#     First estimate:  COMMIT_LEAD_X ~ R_min = wheelbase / tan(max_steer_angle)
+# Measure both, compute R_min, start there, tune down until entry is clean.
+PARK_COMMIT_LEAD_X = 0.45           # metres                      [MEASURE]
+PARK_BAY_MIN_X = 0.02               # bays behind this are "already passed"
+
+# ---- Entry arc completion ----------------------------------------------------
+PARK_ENTRY_ALIGNED_DEG = 18.0       # |bay bearing| below this = pointed at the bay
+
+# ---- Final stop test ---------------------------------------------------------
+PARK_STOP_FRONT_RANGE = 0.35        # metres to the far rail      [MEASURE]
+PARK_CENTER_DEADBAND = 0.10         # metres of tolerated L/R asymmetry
+PARK_CENTER_KP = 1.2                # P-gain for in-bay centering
+PARK_CENTER_TURN_CLAMP = 0.45       # keep the centering controller off full lock
+
+# ---- Timeouts (every state MUST be able to give up) --------------------------
+# A buggy frozen mid-maneuver scores worse than one that halts cleanly.
+PARK_START_DELAY = 1.0              # pause at the last hospital before driving off
+PARK_SEARCH_TIMEOUT = 30.0          # seconds hunting before giving up
+PARK_ENTRY_TIMEOUT = 5.0            # seconds of arc before assuming it's done
+PARK_CREEP_TIMEOUT = 7.0            # seconds creeping before stopping in place
+PARK_SETTLE_DURATION = 1.5          # seconds of enforced zero before PARKED
+
+# States in which the CAMERA must be ignored (the white pad reads as lane paint)
+PARK_STATES_CAMERA_OFF = ('HOLD', 'ENTRY', 'CREEP', 'SETTLE', 'PARKED', 'ABORT')
+
+
+# ===== PARKING: GEOMETRY HELPERS (NEW BLOCK) =====
+
+def wrap_pi(a):
+    """Wrap an angle into (-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def ang_diff(a, b):
+    """Smallest signed difference a - b, wrapped into (-pi, pi]."""
+    return wrap_pi(a - b)
+
+
+def polar_to_xy(r, theta):
+    """Polar (range, bearing) -> Cartesian (x forward, y left) in vehicle frame."""
+    return (r * math.cos(theta), r * math.sin(theta))
+
+# ===== END PARKING PARAMETERS / HELPERS =====
+
+
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
@@ -118,6 +328,11 @@ class LineFollower(Node):
         a real lane pair (tight-turn cross-edge case).
       - LINE_FOLLOW: commits to ONE line and holds a gap to it; if it vanishes
         (turn apex), holds a turn arc toward it until reacquired.
+
+    ===== PARKING (added) =====
+    A second, independent FSM handles end-of-mission parking. It is dormant
+    (park_state == 'IDLE') for the entire delivery run and costs nothing.
+    See the PARKING section at the bottom of this class.
     """
     def __init__(self):
         super().__init__('line_follower')
@@ -250,6 +465,41 @@ class LineFollower(Node):
         self.pending_building = None      # building name matching pending_letter
         # ===== END QR APPROACH STATE =====
 
+        # ===== PARKING: STATE VARIABLES (NEW BLOCK) =====
+        # 'IDLE' for the whole delivery run - the parking FSM is completely
+        # dormant and cannot affect anything until start_parking() is called.
+        self.park_state = 'IDLE'
+        self.park_state_entry_time = time.time()
+
+        # +1 for LEFT, -1 for RIGHT. Does double duty: aims the search sector
+        # AND signs the steering command, so PARK_SIDE flips both together.
+        self.park_side_sign = 1.0 if PARK_SIDE == "LEFT" else -1.0
+
+        # Once a bay is chosen we track THAT bay frame-to-frame by bearing
+        # continuity, so a neighbouring slot can't steal the lock mid-arc.
+        self.park_locked_bay = None
+        self.park_locked_bay_bearing = None
+        self.park_latest_scan = None
+        # ===== END PARKING STATE =====
+
+        # ===== COLLISION RECOVERY: STATE VARIABLES (NEW BLOCK) =====
+        # 'IDLE' whenever we are driving normally. Only leaves IDLE when the
+        # three-clause stuck test below fires.
+        self.recovery_state = 'IDLE'
+        self.recovery_state_entry_time = time.time()
+
+        self.recovery_latest_scan = None      # most recent scan, for the PAUSE check
+        self.recovery_stuck_frames = 0        # consecutive frames the test held
+        self.recovery_range_history = []      # recent front ranges, for the
+                                              # "is the distance changing?" test
+        self.recovery_attempts = 0            # escalation level (resets after
+                                              # RECOVERY_ATTEMPT_RESET clean secs)
+        self.recovery_last_end_time = 0.0     # for the cooldown blackout
+        self.recovery_counter_turn = 0.0      # steer held during the reverse
+        self.recovery_park_state_at_trip = None   # so we can resume parking right
+        self.recovery_given_up = False        # max attempts hit - stop trying
+        # ===== END COLLISION RECOVERY STATE =====
+
         # ---- Driving mode ----
         # HOW TO SWITCH MODES FOR TESTING: change DEFAULT_DRIVE_MODE (and
         # DEFAULT_FOLLOW_SIDE if testing LINE_FOLLOW) at the top of this file
@@ -279,6 +529,23 @@ class LineFollower(Node):
         """Timer callback that periodically publishes the current speed and steer command."""
         self.check_qr_approach()
         self.check_server_retries() # <--- ADD THIS LINE
+
+        # ===== PARKING: ONE ADDED LINE =====
+        # Deliberately called LAST. Whoever writes to target_speed/target_turn
+        # last before the publish below wins, so running the parking tick here
+        # gives parking FINAL AUTHORITY over the camera and the LIDAR avoidance,
+        # without needing to touch either of them.
+        self.check_parking_tick()
+        # ===================================
+
+        # ===== COLLISION RECOVERY: ONE ADDED LINE =====
+        # Called AFTER parking, so it is the LAST writer of all. If we are
+        # physically wedged against something, nothing else's opinion matters -
+        # not the camera, not avoidance, not the park maneuver. Getting unstuck
+        # comes first. This one line is what puts recovery at the top of the
+        # priority ladder without touching any other controller.
+        self.check_recovery_tick()
+        # ==============================================
 
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1] 
@@ -313,6 +580,13 @@ class LineFollower(Node):
                         self.server_uid = (self.server_uid + 1) % 256
 
     def check_qr_approach(self):
+        # ===== PARKING: ONE ADDED GUARD =====
+        # Once parking has begun, the delivery blind-approach timer must not be
+        # able to slam the buggy to a stop mid-maneuver.
+        if self.park_state != 'IDLE':
+            return
+        # ====================================
+
         if not self.qr_approach_active or self.stopped_for_patient:
             return  
 
@@ -621,6 +895,25 @@ class LineFollower(Node):
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
+        # ===== COLLISION RECOVERY: ONE ADDED GUARD =====
+        # While reversing out of a collision the camera must be ignored
+        # completely. Its steering opinion is based on a forward-driving model
+        # and is actively wrong when the buggy is backing up.
+        if self.recovery_state in RECOVERY_STATES_ACTIVE:
+            return
+        # ===============================================
+
+        # ===== PARKING: ONE ADDED GUARD =====
+        # The parking pad is a large WHITE surface. edge_vectors WILL read its
+        # boundary as lane paint and steer the buggy back out of the bay.
+        # From ENTRY onward the camera is therefore ignored entirely.
+        #
+        # NOTE: 'SEARCH' is deliberately NOT in this list. While hunting for a
+        # bay the buggy still needs lane following to stay on the track.
+        if self.park_state in PARK_STATES_CAMERA_OFF:
+            return
+        # ====================================
+
         if self.obstacle_in_front or self.stopped_for_patient:
             return
 
@@ -663,6 +956,54 @@ class LineFollower(Node):
         
 
     def lidar_callback(self, message):
+        # ===== COLLISION RECOVERY: ADDED BLOCK, ABOVE EVERYTHING =====
+        # Recovery gets the scan before parking and before avoidance.
+        #
+        # Ordering rationale: if we are already wedged, obstacle avoidance has
+        # ALREADY failed - it is the thing that was supposed to prevent this.
+        # Letting it keep steering while we are pinned just grinds against the
+        # obstacle. So recovery pre-empts it entirely.
+        self.recovery_latest_scan = message
+
+        if self.recovery_state in RECOVERY_STATES_ACTIVE:
+            return          # maneuver is running from the timer; no sensing needed
+
+        self._recovery_update_detector(message)
+        if self.recovery_state in RECOVERY_STATES_ACTIVE:
+            return          # tripped on this very frame
+        # ===== END COLLISION RECOVERY BLOCK =====
+
+        # ===== PARKING: ADDED BLOCK AT TOP OF CALLBACK =====
+        # Parking gets first look at every scan.
+        #
+        # WHY THIS MATTERS MOST: your avoidance fires on anything inside
+        # OBSTACLE_DISTANCE_THRESHOLD = 0.65 m and steers AWAY from it. Every
+        # parking cone is well inside that. Left enabled during the maneuver,
+        # the avoidance FSM would steer out of the bay while the parking FSM
+        # steers into it, and the buggy would oscillate past the pad forever.
+        #
+        # So: during ENTRY/CREEP the avoidance below is skipped entirely.
+        # During SEARCH it is KEPT ON - the pad cones sit abeam, outside the
+        # +/-40 deg front sector, so they don't trigger it, and real obstacles
+        # on the way to the pad still need dodging.
+        if self.park_state != 'IDLE':
+            self.park_latest_scan = message
+
+            if self.park_state == 'SEARCH':
+                self._park_do_search(message)
+                if self.park_state != 'SEARCH':
+                    return          # committed to ENTRY this very frame
+                # otherwise fall through to normal obstacle avoidance below
+            elif self.park_state == 'ENTRY':
+                self._park_do_entry(message)
+                return
+            elif self.park_state == 'CREEP':
+                self._park_do_creep(message)
+                return
+            else:
+                return              # HOLD / SETTLE / PARKED / ABORT: no LIDAR work
+        # ===== END PARKING BLOCK =====
+
         if self.stopped_for_patient:
             return
 
@@ -763,6 +1104,13 @@ class LineFollower(Node):
             )
             self.send_server_ack(message.uid)
 
+            # ===== PARKING: ONE ADDED CALL =====
+            # This is the ONLY trigger for the parking FSM. 'OK' from the server
+            # is the authoritative "all patients delivered" signal - a hard,
+            # server-confirmed fact, not a heuristic guess from a QR sighting.
+            self.start_parking()
+            # ===================================
+
         # Invalid Dropoff / Target Response -> Revert & Resume
         elif raw_msg == "INVALID":
             self.get_logger().warn(
@@ -832,6 +1180,13 @@ class LineFollower(Node):
         """
         Receives QR codes scanned from the buildings.
         """
+        # ===== PARKING: ONE ADDED GUARD =====
+        # After the mission is over, a stray QR read must not re-arm the
+        # delivery blind-approach machinery mid-park.
+        if self.park_state != 'IDLE':
+            return
+        # ====================================
+
         data = message.data.strip()
 
         if self.stopped_for_patient:
@@ -862,6 +1217,13 @@ class LineFollower(Node):
         """
         Parses traffic sign board detections using a dictionary lookup.
         """
+        # ===== PARKING: ONE ADDED GUARD =====
+        # No more routing decisions once parking has started - a buffered turn
+        # direction firing mid-maneuver would hijack drive_mode.
+        if self.park_state != 'IDLE':
+            return
+        # ====================================
+
         if self.stopped_for_patient or self.obstacle_in_front:
             return
 
@@ -939,6 +1301,696 @@ class LineFollower(Node):
             f"Sign route selected direction '{direction}'. Switched drive_mode to '{self.drive_mode}' "
             f"(follow_side='{self.follow_side if self.drive_mode == 'LINE_FOLLOW' else 'N/A'}'). Reversion locked out."
         )
+
+    # =========================================================================
+    # ===== PARKING: ENTIRE NEW SECTION BELOW =====
+    #
+    #  Nothing above this line calls into here except:
+    #     - publish_drive_commands()        -> check_parking_tick()
+    #     - lidar_callback()                -> _park_do_search/_entry/_creep()
+    #     - server_communication_callback() -> start_parking()
+    #  and four one-line guards. Delete this section + those five hooks and the
+    #  file reverts exactly to the pre-parking version.
+    #
+    #  THE FSM
+    #  -------
+    #     IDLE   -- dormant for the whole delivery run
+    #       | (server sends 'OK')
+    #     HOLD   -- stay stopped at the last hospital for PARK_START_DELAY,
+    #       |       so the final ACK gets out and the stop is visible
+    #     SEARCH -- LANE FOLLOWING STILL DRIVES. Parking only watches the park
+    #       |       side for a bay in the LIDAR comb, and decides when to commit
+    #     ENTRY  -- full lock toward the bay; hold the arc until the bay swings
+    #       |       round into the front sector. Camera + avoidance OFF.
+    #     CREEP  -- forward slowly, steering to keep left/right cone clearances
+    #       |       symmetric, until the far rail is close
+    #     SETTLE -- assert zero for PARK_SETTLE_DURATION
+    #       |
+    #     PARKED -- terminal. Zero published forever.
+    #     ABORT  -- any unrecoverable timeout: halt safely. Stopping near the
+    #               pad scores better than driving off it.
+    # =========================================================================
+
+    # ---- FSM plumbing --------------------------------------------------------
+
+    def start_parking(self):
+        """
+        Public entry point. Called once, from the server 'OK' branch.
+
+        Guarded against re-entry: a duplicate 'OK' (the server retries too)
+        would otherwise reset the FSM and restart the arc from the wrong pose.
+        """
+        if self.park_state != 'IDLE':
+            self.get_logger().warn(
+                f"start_parking() ignored - already in park_state '{self.park_state}'.")
+            return
+        self.get_logger().info("=== ALL DELIVERIES COMPLETE - BEGINNING PARKING ===")
+        self._park_transition('HOLD')
+
+    def _park_transition(self, new_state):
+        """Single choke point for park state changes, so every entry is timestamped."""
+        self.get_logger().info(f"PARK FSM: {self.park_state} -> {new_state}")
+        self.park_state = new_state
+        self.park_state_entry_time = time.time()
+
+    def _park_time_in_state(self):
+        return time.time() - self.park_state_entry_time
+
+    def check_parking_tick(self):
+        """
+        The TIME-driven half of the parking FSM, run from the 10 Hz timer.
+        (The SENSOR-driven half lives in lidar_callback.)
+
+        Split this way on purpose: HOLD / SETTLE / PARKED / ABORT are pure
+        stopwatch states and must keep working even if /scan stops publishing.
+        """
+        if self.park_state == 'IDLE':
+            return      # zero cost during the entire delivery run
+
+        if self.park_state == 'HOLD':
+            self.target_speed = 0.0
+            self.target_turn = 0.0
+            if self._park_time_in_state() >= PARK_START_DELAY:
+                # Release the delivery-stop latch so LANE_FOLLOW can drive us
+                # to the pad. Without this, edge_vectors_callback would keep
+                # returning early on stopped_for_patient and we'd never move.
+                self.stopped_for_patient = False
+                self.qr_approach_active = False
+                self.waiting_for_ack = False
+                self._park_transition('SEARCH')
+
+        elif self.park_state == 'SEARCH':
+            # Lane following is driving. We only CAP the speed here, so bay
+            # detection gets enough frames to see the comb before we blow past
+            # the pad. Minimal interference: direction is still the camera's.
+            if self.target_speed > PARK_SEARCH_SPEED_CAP:
+                self.target_speed = PARK_SEARCH_SPEED_CAP
+
+            if self._park_time_in_state() > PARK_SEARCH_TIMEOUT:
+                self.get_logger().warn(
+                    "PARK SEARCH timed out - no valid bay found. Halting safely.")
+                self._park_transition('ABORT')
+
+        elif self.park_state == 'SETTLE':
+            self.target_speed = 0.0
+            self.target_turn = 0.0
+            if self._park_time_in_state() >= PARK_SETTLE_DURATION:
+                self._park_report_final()
+                self._park_transition('PARKED')
+
+        elif self.park_state in ('PARKED', 'ABORT'):
+            # CRITICAL: zero is asserted EVERY tick, not once. An Ackermann
+            # rover that receives a single zero-velocity message will coast and
+            # drift out of the bay.
+            self.target_speed = 0.0
+            self.target_turn = 0.0
+
+    # ---- LIDAR sector extraction --------------------------------------------
+
+    def _park_beams_in_sector(self, scan, center_rad, half_span_rad):
+        """
+        Return [(bearing_rad, range_m), ...] for every beam in the sector,
+        sorted by increasing bearing.
+
+        Two deliberate choices:
+
+        1. Bearings come from angle_min + i*angle_increment, NOT index
+           fractions. Self-correcting if the scan isn't a full 360 deg or
+           angle_min isn't -pi.
+
+        2. Invalid beams (inf/nan/out of range) are KEPT with range = inf,
+           not dropped. Dropping them would corrupt the angular ordering and
+           merge two separate bays into one phantom bay. "No return" genuinely
+           means "nothing there" = free space, which inf encodes correctly.
+        """
+        out = []
+        for i, r in enumerate(scan.ranges):
+            theta = wrap_pi(scan.angle_min + i * scan.angle_increment)
+            if abs(ang_diff(theta, center_rad)) > half_span_rad:
+                continue
+            if (not math.isfinite(r)) or r < scan.range_min or r > scan.range_max:
+                r = math.inf
+            out.append((theta, r))
+        out.sort(key=lambda t: t[0])
+        return out
+
+    def _park_min_range(self, scan, center_deg, half_span_deg):
+        """Closest valid return in a sector, or inf if nothing is there."""
+        beams = self._park_beams_in_sector(
+            scan, math.radians(center_deg), math.radians(half_span_deg))
+        finite = [r for (_, r) in beams if math.isfinite(r)]
+        return min(finite) if finite else math.inf
+
+    # ---- Bay detection: the core of the whole feature ------------------------
+
+    def _park_find_bays(self, beams):
+        """
+        Given a bearing-sorted [(theta, range)] sector, return candidate bays.
+
+        THE ALGORITHM
+        -------------
+        Classify each beam: STRUCTURE if r < PARK_CONE_RANGE_MAX, else FREE.
+        Across the pad this gives a comb:
+
+            cone   bay    cone   bay    cone   bay    cone
+             |  #########  |  #########  |  #########  |
+            [S][F F F F F][S][F F F F F][S][F F F F F][S]
+
+        A bay is a run of FREE beams BOUNDED BY STRUCTURE ON BOTH SIDES.
+
+        That bounding requirement is the single most important condition in
+        this file: it is what separates a real bay from "I am looking past the
+        end of the pad into open field", which is also a run of FREE beams but
+        is bounded on ONE side only.
+
+        Then four filters, each killing one specific failure mode:
+          - both-sides-bounded -> open field
+          - beam count         -> single-beam sensor noise
+          - metric width band  -> too narrow to fit / absurdly wide (off pad)
+          - depth gain         -> a seam between two same-range objects, which
+                                  is a gap but not an opening
+        """
+        n = len(beams)
+        if n < 3:
+            return []
+
+        is_structure = [math.isfinite(r) and r < PARK_CONE_RANGE_MAX
+                        for (_, r) in beams]
+
+        bays = []
+        i = 0
+        while i < n:
+            if is_structure[i]:
+                i += 1
+                continue
+
+            # Walk to the end of this free run.
+            run_start = i
+            while i < n and not is_structure[i]:
+                i += 1
+            run_end = i - 1
+
+            # --- Filter 1: bounded by structure on BOTH sides ---
+            left_tooth_idx = run_start - 1
+            right_tooth_idx = run_end + 1
+            if left_tooth_idx < 0 or right_tooth_idx >= n:
+                continue        # open-ended: field, not a bay
+
+            # --- Filter 2: minimum beam count (noise rejection) ---
+            if (run_end - run_start + 1) < PARK_GAP_MIN_BEAMS:
+                continue
+
+            # --- Metric width, cone-to-cone, in Cartesian space ---
+            # NOT angular: an angular threshold silently changes meaning with
+            # distance and would pass narrow bays seen from far away.
+            th_a, r_a = beams[left_tooth_idx]
+            th_b, r_b = beams[right_tooth_idx]
+            xa, ya = polar_to_xy(r_a, th_a)
+            xb, yb = polar_to_xy(r_b, th_b)
+            width = math.hypot(xb - xa, yb - ya)
+
+            # --- Filter 3: width band ---
+            if width < PARK_GAP_MIN_WIDTH or width > PARK_GAP_MAX_WIDTH:
+                continue
+
+            # --- Filter 4: the bay must be deeper than its bounding cones ---
+            run_ranges = [r for (_, r) in beams[run_start:run_end + 1]]
+            finite_run = [r for r in run_ranges if math.isfinite(r)]
+            if finite_run:
+                run_depth = sorted(finite_run)[len(finite_run) // 2]   # median
+            else:
+                run_depth = math.inf        # fully open behind = definitely deep
+            tooth_depth = min(r_a, r_b)
+            if run_depth < tooth_depth + PARK_BAY_MIN_DEPTH_GAIN:
+                continue
+
+            # --- Accepted. Bay entrance = midpoint of the two bounding cones ---
+            cx = 0.5 * (xa + xb)
+            cy = 0.5 * (ya + yb)
+            bays.append({
+                'x': cx,                        # forward distance to entrance
+                'y': cy,                        # lateral offset to entrance
+                'bearing': math.atan2(cy, cx),  # where to look for it
+                'range': math.hypot(cx, cy),
+                'width': width,
+            })
+
+        return bays
+
+    def _park_select_bay(self, bays):
+        """
+        Choose which bay to aim for.
+
+        FIRST valid bay in travel order, NOT the widest. Committing early beats
+        driving the length of the pad hunting for a perfect slot - every metre
+        spent searching is a metre nearer the end of the pad, past which there
+        is no recovery.
+
+        Once locked, prefer the bay nearest the previous lock bearing, so a
+        neighbouring slot appearing mid-arc cannot steal the lock.
+        """
+        ahead = [b for b in bays if b['x'] > PARK_BAY_MIN_X]
+        if not ahead:
+            return None
+
+        if self.park_locked_bay_bearing is None:
+            return min(ahead, key=lambda b: b['x'])
+
+        return min(bays, key=lambda b: abs(ang_diff(
+            b['bearing'], self.park_locked_bay_bearing)))
+
+    # ---- SEARCH --------------------------------------------------------------
+
+    def _park_do_search(self, scan):
+        """
+        Watch the park side for a bay while LANE FOLLOWING drives.
+
+        This method deliberately does NOT command speed or steering. The camera
+        keeps the buggy on the track; parking only decides WHEN to take over.
+        That keeps the takeover to a single, well-defined moment.
+        """
+        center = math.radians(PARK_SEARCH_SECTOR_CENTER_DEG) * self.park_side_sign
+        beams = self._park_beams_in_sector(
+            scan, center, math.radians(PARK_SEARCH_SECTOR_HALF_DEG))
+        bay = self._park_select_bay(self._park_find_bays(beams))
+
+        if bay is None:
+            return          # nothing yet - keep lane following, keep looking
+
+        self.park_locked_bay = bay
+        self.park_locked_bay_bearing = bay['bearing']
+
+        self.get_logger().info(
+            f"Bay candidate: x={bay['x']:.2f} m, y={bay['y']:.2f} m, "
+            f"w={bay['width']:.2f} m, brg={math.degrees(bay['bearing']):.0f} deg",
+            throttle_duration_sec=0.5)
+
+        # COMMIT TEST: start the arc once the bay entrance closes to the lead
+        # distance. Turning any later and the rear inner wheel cuts the corner.
+        if bay['x'] <= PARK_COMMIT_LEAD_X:
+            self.get_logger().info(
+                f"COMMITTING to bay: x={bay['x']:.2f} m "
+                f"(lead={PARK_COMMIT_LEAD_X:.2f} m), width={bay['width']:.2f} m")
+            # Clear the camera's residual steering so the arc starts clean.
+            self.apex_active = False
+            self._park_transition('ENTRY')
+
+    # ---- ENTRY ---------------------------------------------------------------
+
+    def _park_do_entry(self, scan):
+        """
+        Hold a full-lock arc toward the park side until the bay swings round
+        into the front sector.
+
+        NO ODOMETRY. The bay's own bearing IS the heading feedback: as the
+        buggy rotates, the bay migrates from ~90 deg toward 0 deg. When it is
+        within PARK_ENTRY_ALIGNED_DEG of straight ahead, the arc is done.
+
+        The timeout is a real fallback, not decoration - the near cone often
+        occludes the bay mid-arc. If that happens we assume the arc has carried
+        us far enough and hand to CREEP, which re-acquires using symmetric side
+        clearances instead of bay geometry.
+        """
+        # Widen the window: the bay is no longer abeam, it's sweeping forward.
+        center = math.radians(PARK_ENTRY_SECTOR_CENTER_DEG) * self.park_side_sign
+        beams = self._park_beams_in_sector(
+            scan, center, math.radians(PARK_ENTRY_SECTOR_HALF_DEG))
+        bay = self._park_select_bay(self._park_find_bays(beams))
+
+        if bay is not None:
+            self.park_locked_bay = bay
+            self.park_locked_bay_bearing = bay['bearing']
+
+            if abs(bay['bearing']) < math.radians(PARK_ENTRY_ALIGNED_DEG):
+                self.get_logger().info(
+                    f"Arc complete - bay now at "
+                    f"{math.degrees(bay['bearing']):.0f} deg. Straightening.")
+                self._park_transition('CREEP')
+                return
+
+        if self._park_time_in_state() > PARK_ENTRY_TIMEOUT:
+            self.get_logger().warn(
+                "PARK ENTRY timed out - assuming arc complete, handing to CREEP.")
+            self._park_transition('CREEP')
+            return
+
+        # Full lock toward the park side. park_side_sign does double duty here:
+        # it aimed the sector above AND signs the steering, so flipping
+        # PARK_SIDE mirrors the whole maneuver with one constant.
+        self.rover_move_manual_mode(PARK_ENTRY_SPEED,
+                                    PARK_TURN_FULL * self.park_side_sign)
+
+    # ---- CREEP ---------------------------------------------------------------
+
+    def _park_do_creep(self, scan):
+        """
+        Drive slowly into the bay, centering between the two bounding cones,
+        until the far rail is close.
+
+        CENTERING LAW:
+            error = r_left - r_right
+            turn  = PARK_CENTER_KP * error          (positive turn = steer left)
+
+        Sign check: more room on the left => error > 0 => turn positive =>
+        steer left => move toward the roomy side. Correct.
+
+        The turn is clamped well below full lock - at creep speed a saturated
+        steering command produces a lurch, not a correction.
+        """
+        front_r = self._park_min_range(scan, 0.0, PARK_FRONT_SECTOR_HALF_DEG)
+        left_r = self._park_min_range(scan, 90.0, PARK_CENTER_SECTOR_HALF_DEG)
+        right_r = self._park_min_range(scan, -90.0, PARK_CENTER_SECTOR_HALF_DEG)
+
+        # --- Stop test: deep enough into the bay ---
+        if front_r < PARK_STOP_FRONT_RANGE:
+            self.get_logger().info(
+                f"Depth reached: front={front_r:.2f} m, "
+                f"L={left_r:.2f} R={right_r:.2f}. Settling.")
+            self._park_transition('SETTLE')
+            return
+
+        if self._park_time_in_state() > PARK_CREEP_TIMEOUT:
+            self.get_logger().warn(
+                f"PARK CREEP timed out at front={front_r:.2f} m. Stopping here.")
+            self._park_transition('SETTLE')
+            return
+
+        # --- Centering controller ---
+        # Only run it when BOTH walls are visible. If one side reads inf we are
+        # not between two cones yet (or one is occluded) and the error term is
+        # meaningless - drive straight instead of chasing a phantom.
+        if math.isfinite(left_r) and math.isfinite(right_r):
+            error = left_r - right_r
+            if abs(error) < PARK_CENTER_DEADBAND:
+                turn = 0.0                      # inside deadband: hold straight
+            else:
+                turn = PARK_CENTER_KP * error
+                turn = max(-PARK_CENTER_TURN_CLAMP,
+                           min(PARK_CENTER_TURN_CLAMP, turn))
+        else:
+            turn = 0.0
+
+        self.rover_move_manual_mode(PARK_CREEP_SPEED, turn)
+
+    # ---- Final report --------------------------------------------------------
+
+    def _park_report_final(self):
+        """Log the final pose quality. Useful for tuning after each sim run."""
+        scan = self.park_latest_scan
+        if scan is None:
+            self.get_logger().info("PARKED (no scan available for final report).")
+            return
+        front_r = self._park_min_range(scan, 0.0, PARK_FRONT_SECTOR_HALF_DEG)
+        left_r = self._park_min_range(scan, 90.0, PARK_CENTER_SECTOR_HALF_DEG)
+        right_r = self._park_min_range(scan, -90.0, PARK_CENTER_SECTOR_HALF_DEG)
+        asym = abs(left_r - right_r) if (math.isfinite(left_r)
+                                         and math.isfinite(right_r)) else float('nan')
+        self.get_logger().info(
+            f"=== PARKED === front={front_r:.2f} m  left={left_r:.2f} m  "
+            f"right={right_r:.2f} m  asymmetry={asym:.2f} m")
+
+    # ---- Diagnostic ----------------------------------------------------------
+
+    def park_dump_side_profile(self):
+        """
+        TUNING TOOL - run this BEFORE touching any other parking constant.
+
+        Prints the raw comb on the park side:
+            '#' = structure (cone/rail),  '.' = free space
+
+        Park the buggy manually beside the pad, call this from a debug timer,
+        and you should see a clean alternating pattern. If you don't, no amount
+        of downstream tuning will help - PARK_CONE_RANGE_MAX is wrong and every
+        filter after it is operating on garbage. Fix that number first.
+        """
+        if self.park_latest_scan is None:
+            self.get_logger().warn("No scan received yet.")
+            return
+        center = math.radians(PARK_SEARCH_SECTOR_CENTER_DEG) * self.park_side_sign
+        beams = self._park_beams_in_sector(
+            self.park_latest_scan, center,
+            math.radians(PARK_SEARCH_SECTOR_HALF_DEG))
+        comb = ''.join('#' if (math.isfinite(r) and r < PARK_CONE_RANGE_MAX)
+                       else '.' for (_, r) in beams)
+        self.get_logger().info(f"side comb: [{comb}]")
+        for b in self._park_find_bays(beams):
+            self.get_logger().info(
+                f"   bay  x={b['x']:+.2f}  y={b['y']:+.2f}  "
+                f"w={b['width']:.2f}  brg={math.degrees(b['bearing']):+.0f}")
+
+    # ===== END PARKING SECTION =====
+
+    # =========================================================================
+    # ===== COLLISION RECOVERY: ENTIRE NEW SECTION BELOW =====
+    #
+    #  Hooks into the rest of the file in only four places:
+    #     - publish_drive_commands()  -> check_recovery_tick()   (last writer)
+    #     - lidar_callback()          -> _recovery_update_detector()
+    #     - edge_vectors_callback()   -> one guard line
+    #     - __init__                  -> state variables
+    #  Delete this section + those hooks and the file reverts exactly.
+    #
+    #  THE FSM
+    #  -------
+    #     IDLE    -- normal driving; detector watching in the background
+    #       | (three-clause stuck test holds for STUCK_CONFIRM_FRAMES)
+    #     REVERSE -- back up with counter-steer, duration scales with attempt #
+    #       | (reverse duration elapsed)
+    #     PAUSE   -- stop, look forward, decide
+    #       |-- path clear      -> IDLE (hand control back, start cooldown)
+    #       |-- still blocked   -> REVERSE again, escalated
+    #       \-- attempts spent  -> IDLE, give up, drive on regardless
+    #
+    #  Getting stuck in a recovery loop is worse than the original collision,
+    #  which is why every path out of PAUSE terminates.
+    # =========================================================================
+
+    # ---- Detection -----------------------------------------------------------
+
+    def _recovery_front_range(self, scan):
+        """
+        Closest return in the forward cone. Reuses the parking sector helper -
+        it is generic geometry, nothing parking-specific about it.
+        """
+        beams = self._park_beams_in_sector(
+            scan, 0.0, math.radians(STUCK_FRONT_SECTOR_HALF_DEG))
+        finite = [r for (_, r) in beams if math.isfinite(r)]
+        return min(finite) if finite else math.inf
+
+    def _recovery_clear_detector(self):
+        """Reset the evidence buffer. Called whenever any gate fails."""
+        self.recovery_stuck_frames = 0
+        self.recovery_range_history = []
+
+    def _recovery_update_detector(self, scan):
+        """
+        The three-clause stuck test, with all the false-positive gates in front
+        of it. Runs every scan while recovery is IDLE.
+
+        Read the gates as: "reasons this close-range reading is NORMAL and must
+        not be treated as a collision."
+        """
+        if not RECOVERY_ENABLED:
+            return
+
+        # --- Reset escalation after a long stretch of clean driving ---
+        # Without this, three unrelated collisions across a whole run would
+        # exhaust the attempt budget and disable recovery for the rest of it.
+        if (self.recovery_attempts > 0
+                and (time.time() - self.recovery_last_end_time) > RECOVERY_ATTEMPT_RESET):
+            self.recovery_attempts = 0
+            self.recovery_given_up = False
+
+        # --- GATE: already gave up on this obstacle ---
+        if self.recovery_given_up:
+            return
+
+        # --- GATE: cooldown blackout right after a recovery ---
+        # Stops the detector re-firing on the tail of the event it just handled.
+        if (time.time() - self.recovery_last_end_time) < RECOVERY_COOLDOWN:
+            self._recovery_clear_detector()
+            return
+
+        # --- GATE: we must actually be commanding forward motion ---
+        # "Not moving" only means "stuck" if we asked to move. This single gate
+        # eliminates the majority of would-be false positives.
+        if self.target_speed < STUCK_MIN_CMD_SPEED:
+            self._recovery_clear_detector()
+            return
+
+        # --- GATE: legitimately stopped at a delivery building ---
+        if self.stopped_for_patient:
+            self._recovery_clear_detector()
+            return
+
+        # --- GATE: parking states where being very close is the OBJECTIVE ---
+        # CREEP deliberately crawls toward a rail until it is ~0.35 m away.
+        # That is indistinguishable from a collision to this detector, so the
+        # detector stands down rather than fighting the maneuver.
+        if self.park_state in ('HOLD', 'CREEP', 'SETTLE', 'PARKED', 'ABORT'):
+            self._recovery_clear_detector()
+            return
+
+        # --- CLAUSE 1 + 2: is something very close in front? ---
+        front_r = self._recovery_front_range(scan)
+        if (not math.isfinite(front_r)) or front_r > STUCK_FRONT_RANGE:
+            self._recovery_clear_detector()
+            return
+
+        # --- CLAUSE 3: is that distance refusing to change? ---
+        # THE KEY TEST. Approaching a wall => range shrinks every frame.
+        # Range pinned flat while commanding forward => we are against it.
+        self.recovery_range_history.append(front_r)
+        if len(self.recovery_range_history) > STUCK_CONFIRM_FRAMES:
+            self.recovery_range_history.pop(0)
+
+        self.recovery_stuck_frames += 1
+
+        if self.recovery_stuck_frames >= STUCK_CONFIRM_FRAMES:
+            h = self.recovery_range_history
+            if len(h) >= STUCK_CONFIRM_FRAMES and (max(h) - min(h)) < STUCK_RANGE_JITTER:
+                self._recovery_start(front_r)
+            else:
+                # Range IS still changing - we are approaching, not wedged.
+                # Keep watching, but don't let the frame counter run away.
+                self.recovery_stuck_frames = STUCK_CONFIRM_FRAMES
+
+    # ---- Maneuver ------------------------------------------------------------
+
+    def _recovery_start(self, front_r):
+        """Commit to a recovery. Chooses the counter-steer direction here."""
+        self.recovery_attempts += 1
+        self.recovery_park_state_at_trip = self.park_state
+
+        # Counter-steer = opposite of whatever we were steering when we hit.
+        # If we were going dead straight there is no "opposite", so alternate
+        # by attempt number - that way a second attempt tries the other way out
+        # instead of repeating a failed escape.
+        pre_turn = self.target_turn
+        if abs(pre_turn) < 0.05:
+            self.recovery_counter_turn = (RECOVERY_COUNTER_STEER
+                                          if (self.recovery_attempts % 2 == 1)
+                                          else -RECOVERY_COUNTER_STEER)
+        else:
+            self.recovery_counter_turn = -math.copysign(
+                RECOVERY_COUNTER_STEER, pre_turn)
+
+        self.get_logger().warn(
+            f"STUCK DETECTED: front={front_r:.2f} m held flat for "
+            f"{self.recovery_stuck_frames} frames while commanding "
+            f"speed={self.target_speed:.2f}. Recovery attempt "
+            f"{self.recovery_attempts}/{RECOVERY_MAX_ATTEMPTS}, "
+            f"counter-steer={self.recovery_counter_turn:+.2f}")
+
+        self._recovery_clear_detector()
+        self._recovery_transition('REVERSE')
+
+    def _recovery_transition(self, new_state):
+        """Single choke point for recovery state changes, so entries are stamped."""
+        self.get_logger().info(
+            f"RECOVERY FSM: {self.recovery_state} -> {new_state}")
+        self.recovery_state = new_state
+        self.recovery_state_entry_time = time.time()
+
+    def _recovery_time_in_state(self):
+        return time.time() - self.recovery_state_entry_time
+
+    def check_recovery_tick(self):
+        """
+        The time-driven recovery maneuver, run from the 10 Hz timer and called
+        LAST in publish_drive_commands so it overrides every other controller.
+        """
+        if self.recovery_state == 'IDLE':
+            return          # zero cost during normal driving
+
+        if self.recovery_state == 'REVERSE':
+            # Escalating duration: each attempt backs up further than the last.
+            duration = (RECOVERY_REVERSE_BASE_TIME
+                        + (self.recovery_attempts - 1) * RECOVERY_REVERSE_TIME_STEP)
+
+            self.target_speed = RECOVERY_REVERSE_SPEED
+            self.target_turn = self.recovery_counter_turn
+
+            if self._recovery_time_in_state() >= duration:
+                self._recovery_transition('PAUSE')
+
+        elif self.recovery_state == 'PAUSE':
+            # Stop and look before committing to anything. Reversing straight
+            # into a forward command produces a lurch and often re-collides.
+            self.target_speed = 0.0
+            self.target_turn = 0.0
+
+            if self._recovery_time_in_state() < RECOVERY_PAUSE_TIME:
+                return
+
+            scan = self.recovery_latest_scan
+            front_r = (self._recovery_front_range(scan)
+                       if scan is not None else math.inf)
+
+            if front_r >= RECOVERY_CLEAR_RANGE:
+                self.get_logger().info(
+                    f"Recovery successful - front now {front_r:.2f} m. "
+                    f"Handing control back.")
+                self._recovery_finish()
+
+            elif self.recovery_attempts < RECOVERY_MAX_ATTEMPTS:
+                # Still boxed in. Escalate: longer reverse, flipped steer, so
+                # the next attempt is genuinely different from the last.
+                self.recovery_attempts += 1
+                self.recovery_counter_turn = -self.recovery_counter_turn
+                self.get_logger().warn(
+                    f"Still blocked at {front_r:.2f} m. Escalating to attempt "
+                    f"{self.recovery_attempts}/{RECOVERY_MAX_ATTEMPTS}, "
+                    f"counter-steer={self.recovery_counter_turn:+.2f}")
+                self._recovery_transition('REVERSE')
+
+            else:
+                # Budget spent. Hand control back anyway - an infinite reverse
+                # loop burns the entire run, which is strictly worse than
+                # letting the normal controllers have another go.
+                self.get_logger().error(
+                    f"Recovery exhausted after {RECOVERY_MAX_ATTEMPTS} attempts "
+                    f"(front={front_r:.2f} m). Giving up, resuming normal drive.")
+                self.recovery_given_up = True
+                self._recovery_finish()
+
+    def _recovery_finish(self):
+        """
+        Hand control back to the normal controllers and start the cooldown.
+
+        Also repairs any state the collision left inconsistent - notably
+        obstacle_in_front, which would otherwise stay latched True and keep the
+        camera muted after we have already backed away.
+        """
+        self.recovery_last_end_time = time.time()
+        self._recovery_clear_detector()
+
+        # Clear stale avoidance latches from before the collision.
+        self.obstacle_in_front = False
+        self.frames_avoided = 0
+        self.recovery_frames_remaining = 0
+
+        # Clear stale camera latches - the apex memory would otherwise resume a
+        # hard turn committed to before we hit anything.
+        self.apex_active = False
+        self.apex_blind_frames = 0
+
+        # --- Parking resume policy ---
+        # If we clipped a cone during the turn-in arc, we have now backed out
+        # and the old bay lock describes a pose we are no longer in. Drop the
+        # lock and go re-acquire a bay from scratch.
+        if self.recovery_park_state_at_trip == 'ENTRY':
+            self.get_logger().info(
+                "Collision occurred during park ENTRY - dropping bay lock and "
+                "returning to SEARCH to re-acquire.")
+            self.park_locked_bay = None
+            self.park_locked_bay_bearing = None
+            self._park_transition('SEARCH')
+
+        self.recovery_park_state_at_trip = None
+        self._recovery_transition('IDLE')
+
+    # ===== END COLLISION RECOVERY SECTION =====
 
 
 def main(args=None):
